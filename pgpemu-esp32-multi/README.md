@@ -1,8 +1,14 @@
 # PGP-Badge ESP32 multi-client firmware
 
+[日本語版 README](README.ja.md)
+
 This directory adapts the original [PGP-Badge](https://github.com/bentomo/PGP-Badge) firmware for up to three simultaneous Pokémon GO BLE connections on an ESP32-WROOM-32. It uses ESP-IDF v4.4.8 and Bluedroid. The original project is distributed under the BSD 2-Clause license; retain the repository's [LICENSE](../LICENSE) and copyright notice when redistributing it.
 
 The code has been built for ESP32. Simultaneous iOS and Android connection, authentication, and reconnection still require hardware testing.
+
+## Acknowledgments
+
+Thanks to [Yohanes Nugroho](https://github.com/yohanes) for the Pokémon GO Plus reverse-engineering work and original BSD-2-Clause-licensed code, and to [bentomo](https://github.com/bentomo/PGP-Badge) and the upstream contributors for the PGP-Badge hardware and ESP32 firmware. This variant builds on their work; it is not an official Pokémon GO or ESP-IDF project.
 
 ## Local device data
 
