@@ -1,6 +1,28 @@
-# Pokemon Go Plus Custom Badge
+# PGP-Badge-Multi
 
-For the ESP32-WROOM-32 three-client variant, see [pgpemu-esp32-multi (English / 日本語)](pgpemu-esp32-multi/README.md). The original single-client firmware remains in `pgpemu-esp32`.
+## 日本語
+
+このForkは、[bentomo/PGP-Badge](https://github.com/bentomo/PGP-Badge)を基に、ESP32-WROOM-32で最大3台のPokémon GO端末を同時接続するための派生版です。元の1台接続版は`pgpemu-esp32`に残し、改修版は`pgpemu-esp32-multi`に分けています。ESP32-C3向けではありません。
+
+改修版はESP-IDF v4.4.8で**ビルド成功**していますが、iPhone・Androidを含む3台同時接続は**これから実機検証**します。GPIO2の青色LEDは接続台数に応じて点滅し、赤色LEDは開発ボードの電源表示です。
+
+取得から実機用Secretの設定、ビルド、書き込み、確認手順までは[英語・日本語併記の改修版README](pgpemu-esp32-multi/README.md)をご覧ください。実機用`secrets.c`と、それを含むファームウェアのバイナリは公開しません。
+
+元プロジェクトはBSD 2-Clauseライセンスです。[LICENSE](LICENSE)と著作権表示を保持しています。[Yohanes Nugroho氏](https://github.com/yohanes)、[bentomo氏](https://github.com/bentomo/PGP-Badge)および元プロジェクトの貢献者の皆様に感謝します。
+
+## English
+
+This fork of [bentomo/PGP-Badge](https://github.com/bentomo/PGP-Badge) adds a separate `pgpemu-esp32-multi` variant for up to three simultaneous Pokémon GO BLE clients on ESP32-WROOM-32. The original single-client `pgpemu-esp32` remains intact. This is not the ESP32-C3 variant.
+
+The variant **builds with ESP-IDF v4.4.8**, but three-device iPhone/Android hardware validation is **still pending**. The blue GPIO2 LED indicates the connection count; the board's red LED is a power indicator.
+
+See the [bilingual variant README](pgpemu-esp32-multi/README.md) for setup, local device data, build, flash, and validation steps. Device-specific `secrets.c` and firmware binaries containing those secrets are not published. The upstream [BSD 2-Clause license](LICENSE) and copyright notice remain in place. Thanks to [Yohanes Nugroho](https://github.com/yohanes), [bentomo](https://github.com/bentomo/PGP-Badge), and the upstream contributors.
+
+---
+
+# Pokemon Go Plus Custom Badge (original upstream README / 元README)
+
+The following historical instructions describe the original project, not the new multi-client variant. 以下は元プロジェクトの説明です。複数端末版の導入には上記の改修版READMEを参照してください。
 
 ## Installing Toolchain
 
