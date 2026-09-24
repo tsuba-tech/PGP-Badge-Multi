@@ -1,6 +1,6 @@
 # Pokemon Go Plus Custom Badge
 
-For the ESP32-WROOM-32 three-client variant, see [pgpemu-esp32-multi](pgpemu-esp32-multi/README.md) ([日本語](pgpemu-esp32-multi/README.ja.md)). The original single-client firmware remains in `pgpemu-esp32`.
+For the ESP32-WROOM-32 three-client variant, see [pgpemu-esp32-multi (English / 日本語)](pgpemu-esp32-multi/README.md). The original single-client firmware remains in `pgpemu-esp32`.
 
 ## Installing Toolchain
 
