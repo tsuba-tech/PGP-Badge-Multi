@@ -6,9 +6,9 @@
 
 ### これは何？現在の状態は？
 
-初代Pokémon GO Plusを模したBLEファームウェアです。元の1台版は`../pgpemu-esp32`に残し、このディレクトリで最大3台の接続を扱います。ESP32-C3用ではありません。GPIO2の青色LEDで接続台数とゲーム結果を表示します。
+初代Pokémon GO Plusを模したBLEファームウェアです。元の1台版は`../pgpemu-esp32`に残し、このディレクトリで最大3台の接続を扱います。ESP32-C3用ではありません。GPIO2の青色LEDは接続台数の確認に使います。
 
-元の1台版はESP32-WROOM-32とiPhone版Pokémon GOで接続済み表示まで確認しています。**この複数端末版はESP-IDF 4.4.8でビルド成功。ただしiPhone・Android・3台目の同時接続とLED結果表示は、これから実機で検証します。** この段階では動作保証版として扱わないでください。
+元の1台版はESP32-WROOM-32とiPhone版Pokémon GOで接続済み表示まで確認しています。**この複数端末版もESP-IDF 4.4.8でビルド・書き込みに成功し、ログ上は3接続とも認証処理の終点まで進みました。青色LEDの接続台数表示は実機で確認できています。** 3台のPokémon GO画面での同時接続、iPhoneとAndroidの混在、1台切断後の独立性は引き続き確認が必要です。
 
 ### 0. 準備するもの
 
@@ -82,7 +82,7 @@ idf.py build
 idf.py -p COM3 flash monitor
 ```
 
-`flash`がESP32へ書き込み、`monitor`が起動後のシリアルログを表示します。モニターを閉じるには`Ctrl+]`を押します。ポートが見つからなければUSBケーブルがデータ通信用か、ドライバーが入っているかを確認します。ポートが使用中なら他のシリアルモニターを閉じます。自動書き込みが始まらないボードでは、画面に`Connecting...`が出たときにBOOTボタン操作が必要な場合があります。
+`flash`がESP32へ書き込み、`monitor`が起動後のシリアルログを表示します。この複数端末版のCOM3への書き込みは実機で成功しています。モニターを閉じるには`Ctrl+]`を押します。ポートが見つからなければUSBケーブルがデータ通信用か、ドライバーが入っているかを確認します。ポートが使用中なら他のシリアルモニターを閉じます。自動書き込みが始まらないボードでは、画面に`Connecting...`が出たときにBOOTボタン操作が必要な場合があります。
 
 以前のWROOM-32実機試験では、初回に`Wrong boot mode detected (0x13)`が出て書き込みに失敗しました。これはビルドエラーではありません。再実行時に**BOOTを押したまま書き込み開始 → `Connecting...`が出たら離す**ことで書き込めました。成功時は`Hash of data verified`と`Hard resetting via RTS pin`が目安です。起動時にBOOTを押す必要はありません。
 
@@ -96,10 +96,8 @@ idf.py -p COM3 flash monitor
 | 接続1台 | 短く1回＋長く1回、繰り返し |
 | 接続2台 | 短く2回＋長く1回、繰り返し |
 | 接続3台 | 短く3回＋長く1回、繰り返し |
-| ポケストップでアイテム取得のLED通知 | 短く4回、その後は接続台数表示へ戻る |
-| ポケモン捕獲成功のLED通知 | 短く5回、その後は接続台数表示へ戻る |
 
-4回・5回はPokémon GOが送る色の並びから結果を判別します。**単にポケストップやポケモンが現れた時ではなく、成功結果の通知が来た時**です。現行のiOS/Android版での分類は、実機試験で確認します。両方の結果通知が近接した場合は順番に表示します。
+接続台数の点灯・点滅は実機で確認できました。青LEDは接続台数を示します。
 
 シリアルログでは次を順に見てください。`conn_id`は端末ごとの接続番号、`slot`はこのファームウェアの0〜2の保管場所です。数字は実際の接続で変わります。
 
@@ -115,13 +113,13 @@ Client connected: conn_id=... slot=2
 Active clients: 3/3
 ```
 
-`cert_state=... -> 6`はファームウェア側の認証手順が終点に進んだ目安です。**Pokémon GOの画面でも接続済みか確認**してください。Androidで長いGATT書き込みが起きると`prepare write conn_id=...`と`exec write conn_id=...`が表示されます。LED結果を認識すると`Game result conn_id=...: Pokestop items`または`Pokemon caught`が表示されます。
+`cert_state=... -> 6`はファームウェア側の認証手順が終点に進んだ目安です。**Pokémon GOの画面でも接続済みか確認**してください。Androidで長いGATT書き込みが起きると`prepare write conn_id=...`と`exec write conn_id=...`が表示されます。
 
 iPhoneを接続したままAndroid、その後3台目を接続し、全端末の接続表示とLEDの1→2→3台パターンを確認します。1台だけ切断したら、その`conn_id`の`Client disconnected`と接続数の減少、Advertising再開を確認します。残りの端末がPokémon GO上で接続済みのままか確かめ、切断した端末を再接続します。ログには機器アドレスや認証データが含まれ得るため、共有前に伏せてください。
 
 ### 謝辞・ライセンス
 
-[Yohanes Nugroho氏](https://github.com/yohanes/pgpemu)の解析と元コード、[bentomo氏とPGP-Badgeの貢献者](https://github.com/bentomo/PGP-Badge)のハードウェア／ESP32実装、[Jesus Bamford氏のSuota Go+](https://github.com/Jesus805/Suota-Go-Plus)の公開情報に感謝します。LEDコマンドの解析には[Fortinetの一次解析記事](https://www.fortinet.com/blog/threat-research/pokemon-go-plus-preview-through-reverse-engineering)、結果パターンの判別には[ar5hil氏のpgpemu-1](https://github.com/ar5hil/pgpemu-1)も参考にしました。元コードの[BSD 2-Clauseライセンス](../LICENSE)と著作権表示を保持しています。Pokémon GOやESP-IDFの公式プロジェクトではありません。
+[Yohanes Nugroho氏](https://github.com/yohanes/pgpemu)の解析と元コード、[bentomo氏とPGP-Badgeの貢献者](https://github.com/bentomo/PGP-Badge)のハードウェア／ESP32実装、[Jesus Bamford氏のSuota Go+](https://github.com/Jesus805/Suota-Go-Plus)の公開情報に感謝します。元コードの[BSD 2-Clauseライセンス](../LICENSE)と著作権表示を保持しています。Pokémon GOやESP-IDFの公式プロジェクトではありません。
 
 ---
 
@@ -129,7 +127,7 @@ iPhoneを接続したままAndroid、その後3台目を接続し、全端末の
 
 ### Purpose and status
 
-This ESP32-WROOM-32 firmware emulates an original Pokémon GO Plus for up to three BLE clients. The original single-client version remains in `../pgpemu-esp32` and previously reached "connected" in Pokémon GO on an iPhone. This is not for ESP32-C3. The multi-client firmware **builds under ESP-IDF 4.4.8**, but three-client iPhone/Android operation and GPIO2 game-result patterns still require hardware testing.
+This ESP32-WROOM-32 firmware emulates an original Pokémon GO Plus for up to three BLE clients. The original single-client version remains in `../pgpemu-esp32` and previously reached "connected" in Pokémon GO on an iPhone. This is not for ESP32-C3. The multi-client firmware **builds and flashes under ESP-IDF 4.4.8**. Logs show three connections progressing through authentication, and the GPIO2 blue LED's connection-count pattern was observed. Connected status in all three apps, mixed iPhone/Android operation, and disconnect isolation still need confirmation.
 
 ### 0. What you need
 
@@ -196,9 +194,9 @@ Connect the board by USB. Find its COM port in Windows Device Manager under **Po
 idf.py -p COM3 flash monitor
 ```
 
-`flash` uploads to the ESP32; `monitor` displays serial logs. Exit monitor with `Ctrl+]`. If no port appears, check cable and USB-serial driver. If the port is busy, close other serial monitors. Some boards need the BOOT button when `Connecting...` appears. Flashing this multi-client variant has not yet been verified.
+`flash` uploads to the ESP32; `monitor` displays serial logs. Flashing this multi-client variant on COM3 succeeded in a hardware test. Exit monitor with `Ctrl+]`. If no port appears, check cable and USB-serial driver. If the port is busy, close other serial monitors. Some boards need the BOOT button when `Connecting...` appears.
 
-In a previous **single-client WROOM-32** trial, the first attempt failed with `Wrong boot mode detected (0x13)`; this was not a build error. Retrying while holding **BOOT**, then releasing it when `Connecting...` appeared, succeeded. `Hash of data verified` and `Hard resetting via RTS pin` indicate a successful flash. Normal boot does not require BOOT. Flashing this multi-client variant is still pending hardware verification.
+In a previous **single-client WROOM-32** trial, the first attempt failed with `Wrong boot mode detected (0x13)`; this was not a build error. Retrying while holding **BOOT**, then releasing it when `Connecting...` appeared, succeeded. `Hash of data verified` and `Hard resetting via RTS pin` indicate a successful flash. Normal boot does not require BOOT.
 
 ### 5. LED and connection checks
 
@@ -208,15 +206,13 @@ Only the **blue GPIO2 LED** is software-controlled; the board's red LED is a pow
 | --- | --- |
 | 0 clients, advertising | Steady on |
 | 1 / 2 / 3 clients | 1 / 2 / 3 short flashes, then one long flash, repeating |
-| PokéStop item success LED command | 4 short flashes, then resume connection count |
-| Pokémon capture success LED command | 5 short flashes, then resume connection count |
 
-Four and five flashes mean a **result notification**, not merely a nearby Pokémon or PokéStop. Result classification from the app's RGB LED sequence still needs iOS/Android hardware validation. Near-simultaneous results are queued.
+The connection-count indicator has been observed on hardware. The blue LED indicates the number of connected clients.
 
-Look for `advertising start successfully`, then `Client connected: conn_id=... slot=0`, `Active clients: 1/3`, and `Advertising restarted for next client`. The firmware's authentication progression should reach `conn_id=... cert_state=2 -> 6` (or `5 -> 6` on reconnect), **and Pokémon GO must also show connected**. Android long writes may log `prepare write conn_id=...` and `exec write conn_id=...`. Recognized results log `Game result conn_id=...: Pokestop items` or `Pokemon caught`.
+Look for `advertising start successfully`, then `Client connected: conn_id=... slot=0`, `Active clients: 1/3`, and `Advertising restarted for next client`. The firmware's authentication progression should reach `conn_id=... cert_state=2 -> 6` (or `5 -> 6` on reconnect), **and Pokémon GO must also show connected**. Android long writes may log `prepare write conn_id=...` and `exec write conn_id=...`.
 
 Keep the iPhone connected, add Android, then a third phone; expect distinct `conn_id` and slots 0, 1, and 2, with `Active clients: 3/3`. Disconnect only one, check the remaining phones stay connected, advertising resumes, and the disconnected phone can reconnect. Redact addresses and authentication traffic before sharing logs.
 
 ### Credits and license
 
-Thanks to [Yohanes Nugroho](https://github.com/yohanes/pgpemu) for the original reverse engineering and code, [bentomo and PGP-Badge contributors](https://github.com/bentomo/PGP-Badge) for hardware and ESP32 firmware, and [Jesus Bamford](https://github.com/Jesus805/Suota-Go-Plus) for the extraction project. [Fortinet's LED-command research](https://www.fortinet.com/blog/threat-research/pokemon-go-plus-preview-through-reverse-engineering) and [ar5hil's pgpemu-1](https://github.com/ar5hil/pgpemu-1) informed the result-pattern heuristic. The upstream [BSD 2-Clause license](../LICENSE) and copyright notice are retained. This is not an official Pokémon GO or ESP-IDF project.
+Thanks to [Yohanes Nugroho](https://github.com/yohanes/pgpemu) for the original reverse engineering and code, [bentomo and PGP-Badge contributors](https://github.com/bentomo/PGP-Badge) for hardware and ESP32 firmware, and [Jesus Bamford](https://github.com/Jesus805/Suota-Go-Plus) for the extraction project. The upstream [BSD 2-Clause license](../LICENSE) and copyright notice are retained. This is not an official Pokémon GO or ESP-IDF project.
