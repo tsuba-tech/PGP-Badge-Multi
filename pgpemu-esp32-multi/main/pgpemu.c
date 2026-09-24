@@ -100,10 +100,21 @@ typedef struct {
     int number_of_patterns;
 } button_event_t;
 
+typedef enum {
+    STATUS_EVENT_POKESTOP_SUCCESS = 4,
+    STATUS_EVENT_POKEMON_CAUGHT = 5,
+} status_event_type_t;
+
+typedef struct {
+    uint16_t conn_id;
+    status_event_type_t type;
+} status_led_event_t;
+
 static pgp_client_t clients[MAX_PGP_CLIENTS];
 
 static QueueHandle_t button_queue;
 static QueueHandle_t status_led_queue;
+static QueueHandle_t status_led_event_queue;
 static int active_client_count(void);
 
 static void update_status_led(void)
@@ -712,10 +723,23 @@ void handle_protocol(esp_gatt_if_t gatts_if,
     }
 }
 
-void handle_led_notify_from_app(uint16_t conn_id, const uint8_t *buffer)
+void handle_led_notify_from_app(uint16_t conn_id, const uint8_t *buffer, size_t len)
 {
+		if (buffer == NULL || len < 4) {
+			ESP_LOGW(GATTS_TABLE_TAG, "Ignoring short LED command conn_id=%u len=%u",
+			         conn_id, (unsigned)len);
+			return;
+		}
 		int number_of_patterns = buffer[3] & 0x1f;
 		int priority = (buffer[3] >> 5) & 0x7;
+		if ((size_t)number_of_patterns > (len - 4) / 3) {
+			ESP_LOGW(GATTS_TABLE_TAG, "Ignoring truncated LED command conn_id=%u len=%u patterns=%d",
+			         conn_id, (unsigned)len, number_of_patterns);
+			return;
+		}
+		int count_red = 0, count_green = 0, count_blue = 0;
+		int count_white = 0, count_off = 0, count_other = 0;
+		int early_white = 0;
 
 		ESP_LOGI(GATTS_TABLE_TAG, "LED: Pattern Count=%d priority: %d", number_of_patterns, priority);
 		//1 pattern = 3 bytes
@@ -727,6 +751,39 @@ void handle_led_notify_from_app(uint16_t conn_id, const uint8_t *buffer)
 			uint8_t green = (pat[1]>>4) & 0xf;
 			uint8_t blue = pat[2] & 0xf;
 			ESP_LOGI(GATTS_TABLE_TAG, "*(%d) #%02x%02x%02x", duration, red, green, blue);
+			if (!red && !green && !blue) {
+				count_off++;
+			} else if (red && !green && !blue) {
+				count_red++;
+			} else if (!red && green && !blue) {
+				count_green++;
+			} else if (!red && !green && blue) {
+				count_blue++;
+			} else if (red && green && blue) {
+				count_white++;
+				if (i <= 9) {
+					early_white++;
+				}
+			} else {
+				count_other++;
+			}
+		}
+		status_led_event_t status_event = {.conn_id = conn_id};
+		if (early_white && count_green && count_blue) {
+			/* Ball shake followed by green/blue: capture success. */
+			status_event.type = STATUS_EVENT_POKEMON_CAUGHT;
+		} else if (!count_off && !count_white && !count_other &&
+		           count_red && count_green && count_blue) {
+			/* Red/green/blue sequence without pauses: Pokestop items. */
+			status_event.type = STATUS_EVENT_POKESTOP_SUCCESS;
+		}
+		if (status_event.type != 0) {
+			ESP_LOGI(GATTS_TABLE_TAG, "Game result conn_id=%u: %s",
+			         conn_id, status_event.type == STATUS_EVENT_POKEMON_CAUGHT ?
+			         "Pokemon caught" : "Pokestop items");
+			if (xQueueSend(status_led_event_queue, &status_event, 0) != pdTRUE) {
+				ESP_LOGW(GATTS_TABLE_TAG, "Status LED event queue full conn_id=%u", conn_id);
+			}
 		}
 		ESP_LOGI(GATTS_TABLE_TAG, "Sending push button");
 		button_event_t event = {
@@ -756,8 +813,9 @@ void pgp_exec_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepar
                     param->exec_write.conn_id);
 
 
-	} else if (led_button_handle_table[IDX_CHAR_LED_VAL] == prepare_write_env->handle) {
-            handle_led_notify_from_app(param->exec_write.conn_id, prepare_write_env->prepare_buf);
+		} else if (led_button_handle_table[IDX_CHAR_LED_VAL] == prepare_write_env->handle) {
+            handle_led_notify_from_app(param->exec_write.conn_id, prepare_write_env->prepare_buf,
+                                       prepare_write_env->prepare_len);
 
 	}
 
@@ -900,7 +958,8 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 		                    param->write.len,
 		                    param->write.conn_id);
 			} else if (led_button_handle_table[IDX_CHAR_LED_VAL] == param->write.handle) {
-				handle_led_notify_from_app(param->write.conn_id, param->write.value);
+				handle_led_notify_from_app(param->write.conn_id, param->write.value,
+                                                   param->write.len);
 			} else {
 				ESP_LOGE(GATTS_TABLE_TAG, "unhandled data: handle: %d", param->write.handle);
 				for (int i =0; i < CERT_LAST_IDX; i++) {
@@ -1109,25 +1168,40 @@ static void auto_button_task(void *pvParameters)
 	}
 }
 
-/* 3 second cycle: N short blue flashes, then one long flash for N clients. */
+/* Connection-count cycle; a completed game event temporarily takes priority. */
 static void status_led_task(void *pvParameters)
 {
     uint8_t connected = 0;
     unsigned tick = 0;
+    status_led_event_t current_event = {0};
+    unsigned event_tick = 0;
     for (;;) {
         uint8_t latest;
         if (xQueueReceive(status_led_queue, &latest, 0) == pdTRUE) {
             connected = latest;
             tick = 0;
         }
-        bool on = connected == 0;
-        if (connected > 0) {
+        if (current_event.type == 0) {
+            xQueueReceive(status_led_event_queue, &current_event, 0);
+            event_tick = 0;
+        }
+        bool on;
+        if (current_event.type != 0) {
+            unsigned flashes = (unsigned)current_event.type;
+            on = event_tick < 2 * flashes && event_tick % 2 == 0;
+            if (++event_tick >= 2 * flashes + 4) {
+                current_event.type = 0;
+                tick = 0;
+            }
+        } else if (connected == 0) {
+            on = true;
+        } else {
             on = (tick < 2 * connected && tick % 2 == 0) ||
                  (tick >= 2 * connected + 2 && tick < 2 * connected + 8);
+            tick = (tick + 1) % 30;
         }
         gpio_set_level(STATUS_LED_GPIO, on ? STATUS_LED_ACTIVE_LEVEL :
                       !STATUS_LED_ACTIVE_LEVEL);
-        tick = (tick + 1) % 30;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -1254,7 +1328,9 @@ void app_main()
 
     button_queue = xQueueCreate(10, sizeof(button_event_t));
     status_led_queue = xQueueCreate(1, sizeof(uint8_t));
+    status_led_event_queue = xQueueCreate(8, sizeof(status_led_event_t));
     configASSERT(status_led_queue != NULL);
+    configASSERT(status_led_event_queue != NULL);
     gpio_config_t status_led_config = {
         .pin_bit_mask = 1ULL << STATUS_LED_GPIO,
         .mode = GPIO_MODE_OUTPUT,
