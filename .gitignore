@@ -1,0 +1,7 @@
+# Local device credentials and generated firmware must never be published.
+/pgpemu-esp32-multi/main/secrets.c
+/pgpemu-esp32-multi/sdkconfig
+/pgpemu-esp32-multi/sdkconfig.old
+/pgpemu-esp32-multi/build/
+/pgpemu-esp32-multi/managed_components/
+
