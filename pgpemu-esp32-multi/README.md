@@ -2,6 +2,8 @@
 
 [日本語](#日本語) | [English](#english)
 
+[設計書 / Design](DESIGN.md) — 接続別状態・通知処理・診断ログの内部構造 / Per-client state, notification scheduling, and diagnostic storage.
+
 ## 日本語
 
 ### これは何？現在の状態は？
@@ -11,6 +13,8 @@
 元の1台版はESP32-WROOM-32とiPhone版Pokémon GOで接続済み表示まで確認しています。**この複数端末版もESP-IDF 4.4.8でビルド・書き込みに成功し、ログ上は3接続とも認証処理の終点まで進みました。青色LEDの接続台数表示は実機で確認できています。** 3台のPokémon GO画面での同時接続、iPhoneとAndroidの混在、1台切断後の独立性は引き続き確認が必要です。
 
 ### 0. 準備するもの
+
+2026-10-10の修正版は実機への書き込み・起動に成功し、`Persistent diagnostics enabled: 512 KiB, previous boot retained`と`advertising start successfully`を確認しました。3台使用時の停止症状への効果はこれから実機で確認します。
 
 | 種類 | 必要なもの |
 | --- | --- |
@@ -68,6 +72,14 @@ python --version
 idf.py --version
 idf.py set-target esp32
 idf.py build
+```
+
+実行ポリシーのエラーが出た場合は、同じPowerShellで次を実行してから続けます。管理者権限は不要で、このウィンドウを閉じると設定は戻ります。パスを引用符で囲むだけでは実行されないので、先頭の`&`も必要です。
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+& "C:\esp\v4.4.8\esp-idf\export.ps1"
+idf.py -p COM3 flash monitor
 ```
 
 `export.ps1`はそのPowerShellセッションでESP-IDFのPython環境と各ツールを使えるようにします。実行ポリシーでブロックされた場合に限り、そのセッションだけ`Set-ExecutionPolicy -Scope Process Bypass`を実行し、`export.ps1`を再実行してください。`idf.py`が見つからない場合は`export.ps1`が成功したか確認します。`set-target esp32`はESP32-WROOM-32を選ぶ操作で、ESP32-C3を選ばないでください。
@@ -157,6 +169,8 @@ This ESP32-WROOM-32 firmware emulates an original Pokémon GO Plus for up to thr
 
 ### 0. What you need
 
+On 2026-10-10, the revised firmware was flashed and booted successfully on hardware, reporting `Persistent diagnostics enabled: 512 KiB, previous boot retained` and `advertising start successfully`. Its effect on the three-client stall still requires field testing.
+
 | Category | Requirement |
 | --- | --- |
 | Source device | An **original Pokémon GO Plus you own**. These steps are not for Pokémon GO Plus +, Poké Ball Plus, or Go-tcha. |
@@ -211,6 +225,14 @@ idf.py build
 ```
 
 `export.ps1` activates ESP-IDF tools in that PowerShell session. If execution policy blocks it, run `Set-ExecutionPolicy -Scope Process Bypass` for that session only and retry. If `idf.py` is not found, check that export completed. Use target **esp32**, not esp32c3. `sdkconfig.defaults` requests `CONFIG_BTDM_CTRL_BLE_MAX_CONN=3`; check generated `sdkconfig` if reusing old settings. After changing IDF version or target in an existing checkout, run `idf.py fullclean` before rebuilding. The built firmware embeds your device data: do not publish it as a release.
+
+For the execution-policy error, run the following in the same PowerShell window. Administrator privileges are not required; the policy change ends when that window closes. Keep the leading `&`: quoting a path alone only prints it.
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+& "C:\esp\v4.4.8\esp-idf\export.ps1"
+idf.py -p COM3 flash monitor
+```
 
 ### 4. Flash and monitor
 

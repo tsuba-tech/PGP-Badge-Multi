@@ -12,6 +12,8 @@
 
 3台で自動操作が止まり、再起動で復帰する症状の報告があります。通知処理の改善と、本体に診断ログを残して後からUSBで回収する機能を追加しています。対策の効果は実機検証中です。使い方は[手順書の診断ログの節](pgpemu-esp32-multi/README.md)をご覧ください。
 
+接続別の状態管理、通知の再試行、保存ログの構造と制約は[設計書（日本語・英語）](pgpemu-esp32-multi/DESIGN.md)にまとめています。2026-10-10の修正版は、実機への書き込み・起動、保存ログ機能の有効化、Advertising開始まで確認済みです。3台使用時の停止症状が解消したという意味ではありません。
+
 ## English
 
 This fork of [bentomo/PGP-Badge](https://github.com/bentomo/PGP-Badge) adds `pgpemu-esp32-multi` for up to three Pokémon GO BLE clients on **ESP32-WROOM-32**. The original single-client firmware remains in `pgpemu-esp32`. This is not an ESP32-C3 build.
@@ -19,6 +21,8 @@ This fork of [bentomo/PGP-Badge](https://github.com/bentomo/PGP-Badge) adds `pgp
 **Status:** The original single-client version reached "connected" in Pokémon GO on an iPhone with ESP32-WROOM-32. The multi-client variant builds and flashes with ESP-IDF 4.4.8; logs show three connections progressing through authentication, and the blue GPIO2 connection-count indicator was observed. Simultaneous connected status in all three Pokémon GO apps, mixed iPhone/Android operation, and disconnect isolation still need confirmation.
 
 All three clients have been reported to stop automatic actions until an ESP32 restart. Notification handling improvements and persistent diagnostics for later USB retrieval have been added; their effectiveness is undergoing field testing. See the diagnostics section of the [setup guide](pgpemu-esp32-multi/README.md).
+
+The [bilingual design document](pgpemu-esp32-multi/DESIGN.md) describes per-client state, notification retries, diagnostic storage, and limitations. On 2026-10-10, the revised firmware was successfully flashed and booted on hardware, enabled persistent diagnostics, and started advertising. This does not establish that the three-client stall has been resolved.
 
 You need the Bluetooth address, Device Key, and Blob from an **original Pokémon GO Plus you own**. The [bilingual setup guide](pgpemu-esp32-multi/README.md) covers equipment, PC environment, extraction risks and steps, local `secrets.c`, building, flashing, and log checks. Neither a usable `secrets.c` nor a firmware binary containing it is published here.
 
