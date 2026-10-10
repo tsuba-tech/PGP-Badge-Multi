@@ -22,6 +22,7 @@
 #include "secrets.h"
 #include "pgp-diag.h"
 #include "pgp-guard.h"
+#include "pgp-led.h"
 #include "esp_timer.h"
 #include "esp_gatt_common_api.h"
 
@@ -127,9 +128,15 @@ static QueueHandle_t notification_queues[MAX_PGP_CLIENTS];
 static notification_client_t notification_clients[MAX_PGP_CLIENTS];
 static portMUX_TYPE notification_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t connection_generation;
+typedef struct {
+    uint32_t generation;
+    uint32_t sent_button, sent_cert;
+    uint32_t requests, caught, fled, spun, errors, off, unknown;
+} client_counters_t;
+static client_counters_t client_counters[MAX_PGP_CLIENTS];
 static QueueHandle_t status_led_queue;
 static int active_client_count(void);
-static void queue_notification(int slot, bool certificate, const uint8_t *data, size_t len);
+static bool queue_notification(int slot, bool certificate, const uint8_t *data, size_t len);
 
 static void sync_notification_client(pgp_client_t *client)
 {
@@ -147,7 +154,7 @@ static void sync_notification_client(pgp_client_t *client)
                      client->generation, client->cert_state, client->cert_notify_enabled);
 }
 
-static void queue_certificate(esp_gatt_if_t gatts_if, uint16_t conn_id,
+static bool queue_certificate(esp_gatt_if_t gatts_if, uint16_t conn_id,
                               uint16_t handle, uint16_t len, uint8_t *data, bool confirm)
 {
     /* All callers use the certificate notification characteristic. */
@@ -156,10 +163,12 @@ static void queue_certificate(esp_gatt_if_t gatts_if, uint16_t conn_id,
     (void)confirm;
     for (int i = 0; i < MAX_PGP_CLIENTS; ++i) {
         if (clients[i].used && clients[i].conn_id == conn_id) {
-            queue_notification(i, true, data, len);
-            return;
+            bool queued = queue_notification(i, true, data, len);
+            if (!queued) pgp_diag_log("CERT_QUEUE_REJECT conn=%u state=%d", conn_id, clients[i].cert_state);
+            return queued;
         }
     }
+    return false;
 }
 
 static void update_status_led(void)
@@ -466,6 +475,9 @@ static pgp_client_t *create_client(uint16_t conn_id, esp_gatt_if_t gatts_if,
             clients[i].conn_id = conn_id;
             clients[i].gatts_if = gatts_if;
             clients[i].generation = ++connection_generation;
+            portENTER_CRITICAL(&notification_lock);
+            client_counters[i] = (client_counters_t){.generation = clients[i].generation};
+            portEXIT_CRITICAL(&notification_lock);
             memcpy(clients[i].remote_bda, remote_bda, sizeof(esp_bd_addr_t));
             xQueueReset(notification_queues[i]);
             sync_notification_client(&clients[i]);
@@ -491,6 +503,14 @@ static int delete_client(uint16_t conn_id)
         return -1;
     }
     int slot = client_slot(client);
+    portENTER_CRITICAL(&notification_lock);
+    client_counters_t summary = client_counters[slot];
+    portEXIT_CRITICAL(&notification_lock);
+    pgp_diag_log("CLIENT_SUMMARY conn=%u gen=%lu button=%lu cert=%lu request=%lu caught=%lu fled=%lu spun=%lu error=%lu off=%lu unknown=%lu",
+        conn_id, (unsigned long)summary.generation, (unsigned long)summary.sent_button,
+        (unsigned long)summary.sent_cert, (unsigned long)summary.requests,
+        (unsigned long)summary.caught, (unsigned long)summary.fled, (unsigned long)summary.spun,
+        (unsigned long)summary.errors, (unsigned long)summary.off, (unsigned long)summary.unknown);
     if (client->prepare_write_env.prepare_buf != NULL) {
         free(client->prepare_write_env.prepare_buf);
     }
@@ -722,8 +742,9 @@ void handle_protocol(esp_gatt_if_t gatts_if,
 
 			//esp_log_buffer_hex(GATTS_TABLE_TAG, client->cert_buffer, 52);
 
-			log_cert_transition(client, 1);
-			queue_certificate(gatts_if, conn_id, certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL], sizeof(notify_data), notify_data, false);
+			if (queue_certificate(gatts_if, conn_id, certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL], sizeof(notify_data), notify_data, false)) {
+            log_cert_transition(client, 1);
+        }
 		} else {
 		        ESP_LOGE(GATTS_TABLE_TAG, "App sends incorrect len=%d", datalen);
 		}
@@ -750,8 +771,9 @@ void handle_protocol(esp_gatt_if_t gatts_if,
 
 		memcpy(client->cert_buffer, temp, 20);
 		client->cert_len = 20;
-		log_cert_transition(client, 2);
-		queue_certificate(gatts_if, conn_id, certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL], sizeof(notify_data), notify_data, false);
+		if (queue_certificate(gatts_if, conn_id, certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL], sizeof(notify_data), notify_data, false)) {
+            log_cert_transition(client, 2);
+        }
             break;
         }
 	case 2:
@@ -773,11 +795,12 @@ void handle_protocol(esp_gatt_if_t gatts_if,
 		memset(client->reconnect_challenge, 0x46, 32);
 
 		uint8_t notify_data[4] =  {0x04, 0x00, 0x23, 0x00 };
-		log_cert_transition(client, 6);
-		queue_certificate(gatts_if,
+		if (queue_certificate(gatts_if,
 					    conn_id,
 					    certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL],
-					    sizeof(notify_data), notify_data, false);
+					    sizeof(notify_data), notify_data, false)) {
+            log_cert_transition(client, 6);
+        }
 		break;
         }
         case 3:
@@ -786,11 +809,12 @@ void handle_protocol(esp_gatt_if_t gatts_if,
 			esp_log_buffer_hex(GATTS_TABLE_TAG, prepare_buf,
 					   datalen);
 			uint8_t notify_data[4] = {0x04, 0x00, 0x01, 0x00};
-			queue_certificate(gatts_if,
+			if (queue_certificate(gatts_if,
 				    conn_id,
 				    certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL],
-				    sizeof(notify_data), notify_data, false);
-			log_cert_transition(client, 4);
+				    sizeof(notify_data), notify_data, false)) {
+            log_cert_transition(client, 4);
+        }
 		}
 		break;
         }
@@ -811,19 +835,21 @@ void handle_protocol(esp_gatt_if_t gatts_if,
 		memset(notify_data, 0, 4);
 		notify_data[0] = 0x05;
 			
-		queue_certificate(gatts_if, conn_id, certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL], sizeof(notify_data), notify_data, false);
-		log_cert_transition(client, 5);
+		if (queue_certificate(gatts_if, conn_id, certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL], sizeof(notify_data), notify_data, false)) {
+            log_cert_transition(client, 5);
+        }
             break;
         }
 	case 5:
         {
 		if (datalen == 5) { //just assume server responsds correctly
 			uint8_t notify_data[4] = {0x04, 0x00, 0x02, 0x00};
-			queue_certificate(gatts_if,
+			if (queue_certificate(gatts_if,
 				conn_id,
 				certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL],
-				sizeof(notify_data), notify_data, false);
-			log_cert_transition(client, 6);
+				sizeof(notify_data), notify_data, false)) {
+            log_cert_transition(client, 6);
+        }
 		}
                 break;
         }
@@ -835,44 +861,35 @@ void handle_protocol(esp_gatt_if_t gatts_if,
 
 void handle_led_notify_from_app(uint16_t conn_id, const uint8_t *buffer, size_t len)
 {
-		if (buffer == NULL || len < 4) {
-			ESP_LOGW(GATTS_TABLE_TAG, "Ignoring short LED command conn_id=%u len=%u",
-			         conn_id, (unsigned)len);
-			return;
-		}
-		int number_of_patterns = buffer[3] & 0x1f;
-		int priority = (buffer[3] >> 5) & 0x7;
-		if ((size_t)number_of_patterns > (len - 4) / 3) {
-			ESP_LOGW(GATTS_TABLE_TAG, "Ignoring truncated LED command conn_id=%u len=%u patterns=%d",
-			         conn_id, (unsigned)len, number_of_patterns);
-			return;
-		}
-
+    pgp_client_t *client = get_client(conn_id);
+    pgp_led_event_t event = pgp_led_classify(buffer, len);
+    if (client == NULL || event == PGP_LED_INVALID) {
+        pgp_diag_log("LED_INVALID conn=%u len=%u", conn_id, (unsigned)len);
+        return;
+    }
+    int slot = client_slot(client);
+    portENTER_CRITICAL(&notification_lock);
+    client_counters_t *counts = &client_counters[slot];
+    if (event == PGP_LED_UNKNOWN) ++counts->unknown;
+    else if (pgp_led_needs_button(event)) ++counts->requests;
+    else if (event == PGP_LED_CAUGHT) ++counts->caught;
+    else if (event == PGP_LED_FLED) ++counts->fled;
+    else if (event == PGP_LED_SPUN) ++counts->spun;
+    else if (event == PGP_LED_OFF) ++counts->off;
+    else ++counts->errors;
+    portEXIT_CRITICAL(&notification_lock);
+    if (event == PGP_LED_UNKNOWN) {
         char hex[195];
         size_t logged_len = len < 97 ? len : 97;
-        for (size_t i = 0; i < logged_len; ++i) {
-            snprintf(hex + 2 * i, 3, "%02x", buffer[i]);
-        }
+        for (size_t i = 0; i < logged_len; ++i) snprintf(hex + 2 * i, 3, "%02x", buffer[i]);
         hex[2 * logged_len] = 0;
-        pgp_diag_log("LED conn=%u len=%u data=%s", conn_id, (unsigned)len, hex);
-		ESP_LOGD(GATTS_TABLE_TAG, "LED: Pattern Count=%d priority: %d", number_of_patterns, priority);
-		//1 pattern = 3 bytes
-		for (int i = 0; i < number_of_patterns; i++) {
-			int p = 4+3*i;
-			const uint8_t *pat = &buffer[p];
-			uint8_t duration = pat[0];
-			uint8_t red = pat[1] & 0xf;
-			uint8_t green = (pat[1]>>4) & 0xf;
-			uint8_t blue = pat[2] & 0xf;
-			ESP_LOGD(GATTS_TABLE_TAG, "*(%d) #%02x%02x%02x", duration, red, green, blue);
-		}
-		ESP_LOGD(GATTS_TABLE_TAG, "Sending push button");
-        pgp_client_t *client = get_client(conn_id);
-        if (client != NULL) {
-            const uint8_t button[2] = {0x03, 0xff};
-            queue_notification(client_slot(client), false, button, sizeof(button));
-        }
-
+        pgp_diag_log("LED_UNKNOWN conn=%u len=%u data=%s", conn_id, (unsigned)len, hex);
+    }
+    ESP_LOGD(GATTS_TABLE_TAG, "LED conn=%u event=%s", conn_id, pgp_led_event_name(event));
+    if (pgp_led_needs_button(event)) {
+        const uint8_t button[2] = {0x03, 0xff};
+        queue_notification(slot, false, button, sizeof(button));
+    }
 }
 
 void pgp_exec_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
@@ -1022,6 +1039,9 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 				if (descr_value == 0x0001 && !client->cert_notify_enabled){
                     /* A new authentication attempt invalidates queued work from the old one. */
                     client->generation = ++connection_generation;
+                    portENTER_CRITICAL(&notification_lock);
+                    client_counters[client_slot(client)] = (client_counters_t){.generation = client->generation};
+                    portEXIT_CRITICAL(&notification_lock);
                     xQueueReset(notification_queues[client_slot(client)]);
 					client->cert_notify_enabled = true;
                     sync_notification_client(client);
@@ -1029,6 +1049,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 
 					uint8_t notify_data[4];
 					memset(notify_data, 0, 4);
+                    int next_cert_state = client->has_reconnect_key ? 3 : 0;
 
 					if (client->has_reconnect_key) {
 						memset(client->cert_buffer, 0, 36);
@@ -1037,18 +1058,18 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 
 						memcpy(client->cert_buffer + 4, client->reconnect_challenge, 32);
 						client->cert_len = 36;
-						log_cert_transition(client, 3);
 
 					} else {
-                        log_cert_transition(client, 0);
 						generate_first_challenge(client);
 					}
 
 					ESP_LOGI(GATTS_TABLE_TAG, "start CERT PAIRING len = %d", param->write.len);
 					ESP_LOGI(GATTS_TABLE_TAG, "notify enable");
 					//the size of notify_data[] need less than MTU size
-					queue_certificate(gatts_if, param->write.conn_id, certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL],
-								    sizeof(notify_data), notify_data, false);
+                    if (queue_certificate(gatts_if, param->write.conn_id, certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL],
+                                          sizeof(notify_data), notify_data, false)) {
+                        log_cert_transition(client, next_cert_state);
+                    }
 
 
 				} else if (descr_value == 0x000) {
@@ -1287,14 +1308,15 @@ static notification_client_t notification_snapshot(int slot)
     return snapshot;
 }
 
-static void queue_notification(int slot, bool certificate, const uint8_t *data, size_t len)
+static bool queue_notification(int slot, bool certificate, const uint8_t *data, size_t len)
 {
     notification_client_t target = notification_snapshot(slot);
     bool enabled = certificate ? target.cert_enabled : target.button_enabled;
     if (!target.used || !enabled || len > 4) {
+        if (target.used && enabled && certificate) pgp_guard_tx_failure(slot, target.generation, true);
         pgp_diag_log("NOTIFY_SKIP slot=%d conn=%u cert=%d used=%d enabled=%d",
                      slot, target.conn_id, certificate, target.used, enabled);
-        return;
+        return false;
     }
     notification_event_t event = {
         .target = target, .certificate = certificate, .len = len,
@@ -1306,7 +1328,9 @@ static void queue_notification(int slot, bool certificate, const uint8_t *data, 
         pgp_diag_log("NOTIFY_QUEUE_FULL conn=%u gen=%lu cert=%d", target.conn_id,
                      (unsigned long)target.generation, certificate);
         ESP_LOGW(GATTS_TABLE_TAG, "Notification queue full conn_id=%u", target.conn_id);
+        return false;
     }
+    return true;
 }
 
 static void broadcast_button(const uint8_t *data, size_t len)
@@ -1323,7 +1347,7 @@ static void notification_task(void *pvParameters)
     bool occupied[MAX_PGP_CLIENTS] = {0};
     unsigned attempts[MAX_PGP_CLIENTS] = {0};
     int64_t retry_at[MAX_PGP_CLIENTS] = {0};
-    int64_t report_at = esp_timer_get_time() + 30000000LL;
+    int64_t report_at = esp_timer_get_time() + 60000000LL;
     for (;;) {
         int64_t now = esp_timer_get_time();
         for (int slot = 0; slot < MAX_PGP_CLIENTS; ++slot) {
@@ -1363,7 +1387,7 @@ static void notification_task(void *pvParameters)
             uint16_t handle = event->certificate ?
                 certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL] :
                 led_button_handle_table[IDX_CHAR_BUTTON_VAL];
-            if (attempts[slot] == 0) {
+            if (attempts[slot] == 0 && event->certificate) {
                 pgp_diag_log("NOTIFY_TRY conn=%u gen=%lu cert=%d", event->target.conn_id,
                              (unsigned long)event->target.generation, event->certificate);
             }
@@ -1371,7 +1395,14 @@ static void notification_task(void *pvParameters)
                 event->target.conn_id, handle, event->len, event->data, false);
             ++attempts[slot];
             if (err == ESP_OK) {
-                pgp_diag_log("NOTIFY_SENT conn=%u gen=%lu cert=%d attempts=%u",
+                portENTER_CRITICAL(&notification_lock);
+                client_counters_t *counts = &client_counters[slot];
+                if (counts->generation == event->target.generation) {
+                    if (event->certificate) ++counts->sent_cert;
+                    else ++counts->sent_button;
+                }
+                portEXIT_CRITICAL(&notification_lock);
+                if (event->certificate || attempts[slot] > 1) pgp_diag_log("NOTIFY_SENT conn=%u gen=%lu cert=%d attempts=%u",
                              event->target.conn_id, (unsigned long)event->target.generation,
                              event->certificate, attempts[slot]);
                 occupied[slot] = false;
@@ -1387,12 +1418,21 @@ static void notification_task(void *pvParameters)
         if (now >= report_at) {
             for (int slot = 0; slot < MAX_PGP_CLIENTS; ++slot) {
                 notification_client_t state = notification_snapshot(slot);
-                pgp_diag_log("TX_HEALTH slot=%d used=%d conn=%u gen=%lu cert_cccd=%d button_cccd=%d congested=%d queued=%u pending=%d",
-                             slot, state.used, state.conn_id, (unsigned long)state.generation,
+                if (!state.used) continue;
+                portENTER_CRITICAL(&notification_lock);
+                client_counters_t counts = client_counters[slot];
+                portEXIT_CRITICAL(&notification_lock);
+                if (counts.generation != state.generation) continue;
+                pgp_diag_log("TX_HEALTH slot=%d conn=%u gen=%lu cc=%d/%d busy=%d q=%u p=%d sent=%lu req=%lu caught=%lu fled=%lu spun=%lu err=%lu off=%lu unk=%lu",
+                             slot, state.conn_id, (unsigned long)state.generation,
                              state.cert_enabled, state.button_enabled, state.congested,
-                             (unsigned)uxQueueMessagesWaiting(notification_queues[slot]), occupied[slot]);
+                             (unsigned)uxQueueMessagesWaiting(notification_queues[slot]), occupied[slot],
+                             (unsigned long)counts.sent_button, (unsigned long)counts.requests,
+                             (unsigned long)counts.caught, (unsigned long)counts.fled,
+                             (unsigned long)counts.spun, (unsigned long)counts.errors,
+                             (unsigned long)counts.off, (unsigned long)counts.unknown);
             }
-            report_at = now + 30000000LL;
+            report_at = now + 60000000LL;
         }
         pgp_guard_task_progress();
         vTaskDelay(pdMS_TO_TICKS(20));

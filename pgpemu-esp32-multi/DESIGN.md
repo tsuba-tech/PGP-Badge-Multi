@@ -100,11 +100,11 @@ Each 256-byte little-endian record contains magic (4), sequence (4), uptime mill
 | --- | --- |
 | `BOOT` | 再起動理由・版・保存バンク / Reset reason, version, bank |
 | 接続・認証・`CCCD` / Connection, auth, CCCD | どの接続がどこまで進んだか / Per-connection progression |
-| LEDコマンド / LED commands | アプリから操作要求が来ているか。捕獲成功を分類しない / Incoming app activity, not capture-success classification |
+| `LED_UNKNOWN`, `TX_HEALTH`, `CLIENT_SUMMARY` | 未知パターン詳細と既知の要求・結果の集計。ゲーム画面での成功確認ではない / Unknown patterns and aggregate inferred requests/results, not independently verified game outcomes |
 | `NOTIFY_TRY`, `NOTIFY_SENT`, `NOTIFY_RETRY` | 送信開始・API受理・即時失敗 / Start, API acceptance, immediate failure |
 | `NOTIFY_DROP`, `NOTIFY_QUEUE_FULL`, `NOTIFY_ASYNC_FAIL` | 期限・世代・購読・満杯・非同期失敗 / Expiry, generation, subscriptions, overflow, async failure |
 | `CONGEST`, `TX_HEALTH` | 接続別の混雑・残キュー・保留 / Per-client congestion, queue and pending item |
-| `HEARTBEAT` | 30秒ごとの接続数、Advertising、メモリ、イベント数、欠落数 / 30-s client, advertising, memory, event and loss summary |
+| `HEARTBEAT` | 接続中60秒・未接続600秒ごとの接続数、Advertising、メモリ、イベント数、欠落数 / Client, advertising, memory, event and loss summary every 60 s connected / 600 s idle |
 
 回収は`tools/download-diagnostics.py --port COM3`をESP-IDFのPythonで実行する。診断領域だけを読み、テキスト化する。操作前後のリセットがあるため、不要な再起動を重ねず早めに回収する。取得前の`erase-flash`は禁止。単体テストは`python -m unittest discover -s tools -p test_diagnostics.py`。
 
@@ -160,3 +160,35 @@ In `GUARD_BOOT`, `cause` is 0=no planned cause, 1=stalled callback, 2=all discon
 6. 回線不良と対象なしの状況で誤切断しないこと、保存ログの取得ができることを確認する。
 
 Test idle authenticated operation with two then three phones; isolate an intentionally stalled handshake; inject notification-task, advertising and disconnect faults in a test-only build; verify reset reasons, three-reset loop protection and full-power-cycle recovery; confirm poor phone connectivity/absence of targets does not trigger false disconnects, and retrieve saved diagnostics. Fault injection is not enabled in normal firmware.
+
+## 9. 操作判別・認証受付・記録負荷の改善 / Request classification, authentication acceptance and logging
+
+`main/pgp-led.c`は[spezifisch/pgpemuのLED判別](https://github.com/spezifisch/pgpemu/blob/master/pgpemu-esp32/main/pgp_led_handler.c)を基にした独立したCモジュール。BSD表示を`main/LICENSE.LED`に保持する。長さを検証した上で、各パターンのRGB下位4bitと消灯・白点滅等の組み合わせを調べる。振動／補間bitは色判定に含めない。緑のみ・黄のみ・青のみの要求に自動応答し、既知の結果・エラー・消灯では押さない。未知の有効パターンは従来どおり押し、`LED_UNKNOWN`で原文を残す。公式プロトコル仕様ではなく観測ベースの判別であるため、新パターンには追加検証が必要。
+
+`main/pgp-led.c` adapts the [spezifisch LED classifier](https://github.com/spezifisch/pgpemu/blob/master/pgpemu-esp32/main/pgp_led_handler.c), with BSD notices in `main/LICENSE.LED`. After bounds checks it examines RGB nibbles and combinations of off/white patterns, excluding vibration/interpolation bits from color. Known green/yellow/blue requests trigger buttons; recognized results/errors/off do not. Unknown valid patterns retain legacy button behavior and detailed `LED_UNKNOWN` logging. This is observation-based, not an official protocol specification.
+
+`queue_notification`／`queue_certificate`はキュー受付の成否を返す。全6段階の認証遷移と最初のCCCD購読時の状態設定は、受付成功時だけ進める。応答用バッファは接続専用のまま。満杯は該当世代の監視へ即時報告し、認証状態の停滞にも期限を設ける（第8節）。認証終点への遷移もキュー受付を示すだけで、無線送達やアプリの接続済み表示とは区別する。Advertising復旧は第8節の周期監視を再利用する。
+
+`queue_notification`/`queue_certificate` return acceptance. All six authentication transitions and the initial CCCD-triggered state update advance only on acceptance. Response buffers remain per-client. Overflow immediately reports a fault for that generation; section 8 supplies authentication deadlines. Even the final state transition denotes queue acceptance, not radio delivery or app connected status. Advertising recovery reuses section 8's periodic supervision.
+
+通常ボタン通知の初回送信ログと既知LEDコマンドの逐次保存をやめ、接続世代ごとのカウンターを短いロック下で更新する。接続中スロットだけ60秒ごとに`TX_HEALTH`、切断時に`CLIENT_SUMMARY`を保存する。認証通知・再試行・異常は詳細を維持する。`TX_HEALTH`の`cc`は認証／ボタンの購読、`busy`は混雑、`q`はキュー残数、`p`は保留、`sent`はボタンAPI受付、`req`は既知要求、`caught/fled/spun`は推定結果、`err/off/unk`は表示エラー／消灯／未知。GPIO2は台数表示のみ。対象がいないだけではwatchdogを発動しない。
+
+First-attempt normal button logs and individual known LED records become counters protected by a short lock. Only active slots emit 60-s `TX_HEALTH`; disconnect emits `CLIENT_SUMMARY`. Certificate/retry/failure detail remains. `cc` = certificate/button subscriptions; `busy` = congestion; `q` = queue depth; `p` = pending; `sent` = button API acceptance; `req` = known requests; `caught/fled/spun` = inferred results; `err/off/unk` = errors/off/unknown. Counters reset with connection/authentication generation. GPIO2 remains connection-count only; no-target inactivity never triggers watchdog recovery.
+
+保存後に256byteを読み戻して比較し、不一致・読み書きエラーで記録を停止する。起動時`DIAG_SCAN`と取得ツールは、識別子なしの非消去領域`non_record`と有効識別子付きCRC不一致`crc_bad`を分ける。2026-10-11回収分は正常1269件・識別子なし736領域・消去43領域・CRC不一致0件だった。識別子なし領域の由来は未確定であり、生ダンプを公開しない。レコード形式と過去ログの互換性は維持する。接続なしの`HEARTBEAT`は600秒へ減らし、新規接続後は60秒以内へ期限を戻す。
+
+Each 256-byte write is read back and compared; mismatch/read/write errors stop recording. Boot `DIAG_SCAN` and export distinguish non-erased missing-magic slots (`non_record`) from recognized records failing CRC (`crc_bad`). The 2026-10-11 dump had 1,269 valid, 736 non-record, 43 erased and zero CRC-bad slots. Non-record data's origin is unconfirmed: raw dumps must not be published. Record format/backward compatibility are unchanged. Idle `HEARTBEAT` interval becomes 600 s, shortened to at most 60 s after a new connection.
+
+### ホストテスト / Host tests
+
+Linux/WSLのPython 3と`cc`で、改修版フォルダーから次を実行する。WindowsネイティブではCコンパイラーを必要とする2クラスはスキップするため、全項目確認にはLinux/WSLを使う。
+
+Run from this project with Python 3 and `cc` on Linux/WSL. The two native-C test classes skip on Windows; use Linux/WSL for full coverage.
+
+```sh
+python3 -m unittest discover -s tools -p 'test_*.py' -v
+```
+
+本体と同じLED分類Cコードを境界値・切り詰め・ランダム入力で検証し、認証ハンドラーの実コードを暗号処理・キューのモックと組み合わせて受付成功／失敗・接続分離を検証する。暗号の正しさ、BLE配送、スケジューリング、watchdog故障復旧の実機テストの代わりではない。非公開ログを`PGP_LED_REPLAY`に指定した実行では103コマンドの分類も再生し、計18テストを通過した。通常実行は非公開ログの項目をスキップする。
+
+Tests compile the production LED classifier with boundary/truncation/random inputs and the actual authentication handler control flow with mocked crypto/queue operations, checking accepted/rejected transitions and peer isolation. They do not validate cryptography, BLE delivery, scheduling or hardware watchdog recovery. An optional private-log replay via `PGP_LED_REPLAY` classified 103 commands; all 18 tests passed with that input. Normal runs skip that private fixture.

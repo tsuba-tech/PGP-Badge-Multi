@@ -143,7 +143,7 @@ idf.py -p COM3 flash monitor
 
 `menuconfig`では**Partition Table → Partition Table → Custom partition table CSV**を選び、ファイル名を`partitions.csv`にして保存してからビルドします。古い`sdkconfig`がある場合、`sdkconfig.defaults`だけでは既存設定を上書きしません。起動時の`PGP_DIAG: Persistent diagnostics enabled: 512 KiB, previous boot retained`を確認したら、`Ctrl+]`でモニターを終了して外へ持ち出せます。この版は**アプリだけでなくパーティションテーブルも含む通常の`flash`**で書き込んでください。NVSとアプリの配置は従来と同じです。
 
-記録するのは接続・切断理由、認証状態の進行、通知購読、LEDコマンド、通知送信・再試行・期限切れ、混雑状態、30秒ごとの空きメモリとBLEイベント数です。認証のMAC・Device Key・Blob・session keyや認証ペイロードは保存しません。`NOTIFY_SENT`はBLEスタックに渡せたという意味で、捕獲成功の判定ではありません。
+記録するのは接続・切断理由、認証状態の進行、通知購読、未知のLEDコマンド、認証通知・再試行・期限切れ、混雑状態です。通常のボタン送信と既知のLEDコマンドは端末別に集計し、接続中は60秒ごとに`TX_HEALTH`を残します。空きメモリとBLEイベント数の`HEARTBEAT`は接続中60秒、未接続時600秒間隔です。認証のMAC・Device Key・Blob・session keyや認証ペイロードは保存しません。`NOTIFY_SENT`はBLEスタックに渡せたという意味で、捕獲成功の判定ではありません。
 
 問題が出たらESP32を再起動してかまいません。512KBを2つの領域に分け、再起動するたびに保存先を切り替えます。各領域は直近約1,024件を循環保存し、再起動前の領域は次の起動中に上書きしません。ただし再起動を重ねると古い起動の記録は上書きされます。電源を落とした瞬間にRAMキューに残っていた記録や、書き込み途中の最後の記録は失われる場合があります。`HEARTBEAT`内の`lost`はRAMキューが満杯で保存できなかった件数です。
 
@@ -177,7 +177,21 @@ python .\tools\download-diagnostics.py --port COM3
 
 ESP32はAdvertisingを再開できますが、**スマホへ再接続を強制することはできません**。アプリ側が自動で戻らなければPokémon GOの接続ボタンを押してください。本体再起動時は全端末が一度切断されます。LEDは引き続き接続台数だけを表示します。
 
+### 8. 自動操作・認証・ログの改善（2026-10-11）
+
+自動ボタン応答は、既知のポケモン・未登録ポケモン・ポケストップの操作要求だけへ返します。既知の捕獲結果、逃走、回収結果、バッグ満杯・ボックス満杯・ボール不足等の表示、消灯には返しません。判別できないパターンは取りこぼし防止のため従来どおり応答し、`LED_UNKNOWN`を保存します。これはゲームが送るLEDパターンの判別であり、GPIO2で4回・5回点滅させる機能ではありません。
+
+認証通知をキューへ入れられないときは認証状態を先へ進めず、監視による該当端末だけの復旧につなげます。キュー受付は実際の通信成功を保証しないため、その後の送信期限・非同期失敗も監視します。Advertisingの定期再試行は前節の監視が担当します。
+
+`TX_HEALTH`の`cc`は認証／ボタンの購読、`busy`は混雑、`q`はキュー残数、`p`は保留通知です。`sent`は通常ボタンのAPI受付数、`req`は既知の操作要求数、`caught`・`fled`・`spun`はLEDパターンから推定した結果数、`err`・`off`・`unk`はエラー表示・消灯・未知パターン数です。カウンターは接続・認証世代ごとの累計で、切断時にも`CLIENT_SUMMARY`を残します。ゲーム画面上の実際の捕獲数を保証するものではありません。
+
+保存時は書き込み後に読み戻して照合します。取得ツールの`non_record`は診断レコードの識別子がない領域、`crc_bad`は識別子があるのにCRCが合わないレコードです。両者を保存破損として一括扱いしません。実機ログを再調査した結果、以前の「CRC不一致736件」は識別子のない736領域で、CRC不一致は0件でした。旧データ等が残っている可能性があるため、診断領域の生バイナリも公開しないでください。
+
+CコードのLED分類・認証遷移と診断デコーダーをホスト上でテストしています。変更後の捕獲・2〜3台運用・自動復旧は実機での確認が必要です。まず2台で試し、問題の時刻と診断ログを残してください。スマホの再接続はPokémon GO側の操作が必要な場合があります。
+
 ### 謝辞・ライセンス
+
+LEDコマンドの判別には[spezifisch/pgpemu](https://github.com/spezifisch/pgpemu/blob/master/pgpemu-esp32/main/pgp_led_handler.c)の知見を利用しています。Yohanes Nugroho氏、spezifisch氏にも感謝します。この部分のBSD 2-Clause著作権・ライセンス表示は[main/LICENSE.LED](main/LICENSE.LED)に保持しています。
 
 [Yohanes Nugroho氏](https://github.com/yohanes/pgpemu)の解析と元コード、[bentomo氏とPGP-Badgeの貢献者](https://github.com/bentomo/PGP-Badge)のハードウェア／ESP32実装、[Jesus Bamford氏のSuota Go+](https://github.com/Jesus805/Suota-Go-Plus)の公開情報に感謝します。元コードの[BSD 2-Clauseライセンス](../LICENSE)と著作権表示を保持しています。Pokémon GOやESP-IDFの公式プロジェクトではありません。
 
@@ -297,7 +311,7 @@ idf.py -p COM3 flash monitor
 
 In `menuconfig`, select **Partition Table → Partition Table → Custom partition table CSV**, set its filename to `partitions.csv`, and save. Defaults do not override an existing configuration. Confirm `PGP_DIAG: Persistent diagnostics enabled: 512 KiB, previous boot retained`, then exit with `Ctrl+]`. Use the full `flash` command to update both the application and partition table. Existing NVS and application offsets are preserved.
 
-Records contain connection/disconnection reasons, authentication state progression, subscriptions, LED commands, notification attempts/retries/expiry, congestion, and 30-second memory/BLE-event heartbeats. They exclude MAC addresses, Device Key, Blob, session keys, and authentication payloads. `NOTIFY_SENT` means accepted by the BLE stack, not successful capture.
+Records contain connection/disconnection reasons, authentication progression, subscriptions, unknown LED commands, certificate notifications, retries, expiry and congestion. Normal button sends and known LED patterns are aggregated into per-client `TX_HEALTH` reports every 60 seconds while connected. Memory/BLE-event `HEARTBEAT` intervals are 60 seconds connected and 600 seconds idle. Records exclude MAC addresses, Device Key, Blob, session keys and authentication payloads. `NOTIFY_SENT` means accepted by the BLE stack, not successful capture.
 
 The 512-KiB partition has two circular banks, each holding roughly 1,024 recent records. Rebooting switches banks and preserves the previous boot's bank during the next run. Further reboots eventually overwrite older boots. Pending RAM records and a partially written final record may be lost on power removal. Heartbeat `lost` counts records dropped because the RAM queue was full.
 
@@ -331,6 +345,20 @@ After three consecutive automatic resets, task-watchdog panic and supervisor glo
 
 The ESP32 can resume advertising but **cannot force the phone to reconnect**. Tap the connection control in Pokémon GO if the app does not reconnect. A global reset disconnects every phone. The blue LED continues to show connection count only.
 
+### 8. Automatic actions, authentication and logging improvements (2026-10-11)
+
+Automatic buttons now respond to known Pokémon, new-Pokémon and PokéStop requests, not known catch/flee/spin results, bag/box/ball/range errors or off commands. Unknown valid patterns retain the legacy button fallback and generate `LED_UNKNOWN` for investigation. This classifies the app's protocol patterns; it does not add four/five-flash GPIO2 displays.
+
+Authentication state advances only when its notification is accepted into the queue. Rejection leads into affected-peer recovery. Queue acceptance does not guarantee delivery: subsequent expiry and asynchronous failures are still supervised. Periodic advertising recovery is handled by the watchdog section above.
+
+In `TX_HEALTH`, `cc` is certificate/button subscription status, `busy` congestion, `q` queue depth and `p` a pending notification. `sent` counts accepted button sends; `req` known requests; `caught`/`fled`/`spun` inferred LED results; `err`/`off`/`unk` error/off/unknown patterns. Counters accumulate per connection/authentication generation and also appear in `CLIENT_SUMMARY` at disconnect. They are not independently verified game-screen capture totals.
+
+Each flash record is read back and compared after writing. Export reports distinguish `non_record` (missing diagnostic magic) from `crc_bad` (recognized record with a CRC mismatch). Rechecking the field dump found 736 non-record slots and zero CRC failures, not 736 damaged records. Old data may remain in unused sectors: do not publish raw diagnostic binaries either.
+
+Host tests exercise the production LED classifier, authentication transition control flow and decoder. Capture behavior, two/three-phone operation and recovery after this change still need hardware verification. Start with two phones and retain diagnostics with approximate fault times. Phone reconnection may require a Pokémon GO action.
+
 ### Credits and license
+
+LED classification draws on [spezifisch/pgpemu](https://github.com/spezifisch/pgpemu/blob/master/pgpemu-esp32/main/pgp_led_handler.c). Thanks also to Yohanes Nugroho and spezifisch; the BSD 2-Clause copyright/license notice for this portion is retained in [main/LICENSE.LED](main/LICENSE.LED).
 
 Thanks to [Yohanes Nugroho](https://github.com/yohanes/pgpemu) for the original reverse engineering and code, [bentomo and PGP-Badge contributors](https://github.com/bentomo/PGP-Badge) for hardware and ESP32 firmware, and [Jesus Bamford](https://github.com/Jesus805/Suota-Go-Plus) for the extraction project. The upstream [BSD 2-Clause license](../LICENSE) and copyright notice are retained. This is not an official Pokémon GO or ESP-IDF project.

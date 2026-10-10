@@ -28,24 +28,34 @@ def esptool_command():
     raise SystemExit("ESP-IDF tools are not active. Run export.ps1 in this PowerShell session first.")
 
 
-def decode_records(data):
+def decode_details(data):
     if len(data) != FLASH_SIZE:
         raise ValueError(f"Expected {FLASH_SIZE} diagnostic bytes, got {len(data)}")
     records = []
-    invalid = 0
+    counts = {"erased": 0, "non_record": 0, "crc_bad": 0}
     for offset in range(0, len(data), RECORD_SIZE):
         raw = data[offset:offset + RECORD_SIZE]
         if raw == b"\xff" * RECORD_SIZE:
+            counts["erased"] += 1
             continue
         magic, sequence, uptime = struct.unpack_from("<IIQ", raw)
         crc, = struct.unpack_from("<I", raw, 252)
-        if magic != MAGIC or zlib.crc32(raw[:252]) != crc:
-            invalid += 1
+        if magic != MAGIC:
+            counts["non_record"] += 1
+            continue
+        if zlib.crc32(raw[:252]) != crc:
+            counts["crc_bad"] += 1
             continue
         message = raw[16:252].split(b"\0", 1)[0].decode("utf-8", errors="replace")
         records.append((sequence, uptime, message))
     records.sort(key=lambda record: record[0])
-    return records, invalid
+    return records, counts
+
+
+def decode_records(data):
+    """Compatibility wrapper: skipped slots are not necessarily CRC failures."""
+    records, counts = decode_details(data)
+    return records, counts["non_record"] + counts["crc_bad"]
 
 
 def main():
@@ -68,12 +78,14 @@ def main():
                             "--port", args.port, "--baud", "115200", "read_flash",
                             hex(FLASH_OFFSET), hex(FLASH_SIZE), str(dump)], check=True)
             data = dump.read_bytes()
-    records, invalid = decode_records(data)
+    records, counts = decode_details(data)
     if not records:
         raise SystemExit("No valid diagnostic records. Check that the diagnostic firmware and partition table were flashed.")
     with args.output.open("x", encoding="utf-8") as output:
         output.write("PGP-Badge-Multi persistent diagnostics v1\n")
-        output.write(f"Records={len(records)} invalid_or_interrupted={invalid}\n")
+        output.write(f"Records={len(records)} non_record={counts['non_record']} "
+                     f"crc_bad={counts['crc_bad']} erased={counts['erased']}\n")
+        output.write("non_record may be old/uninitialized data or partial headers; it is not a CRC failure.\n")
         output.write("Uptime restarts at each BOOT; sequence preserves order across reboots.\n\n")
         for sequence, uptime, message in records:
             output.write(f"{sequence:010d} +{uptime / 1000:012.3f}s {message}\n")

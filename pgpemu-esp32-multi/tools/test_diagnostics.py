@@ -41,6 +41,15 @@ class DiagnosticDecoderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             diagnostics.decode_records(b"short")
 
+    def test_foreign_data_is_not_a_crc_failure(self):
+        data = bytearray(b"\xff" * diagnostics.FLASH_SIZE)
+        data[:256] = b"\x3d\xf0" * 128
+        data[256:512] = record(1, 10, "BOOT")
+        data[280] ^= 1
+        decoded, counts = diagnostics.decode_details(data)
+        self.assertEqual(decoded, [])
+        self.assertEqual(counts, {"non_record": 1, "crc_bad": 1, "erased": 2046})
+
 
 if __name__ == "__main__":
     unittest.main()

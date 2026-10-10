@@ -16,6 +16,8 @@
 
 2026-10-11に[Watchdogと段階的な自動復旧](pgpemu-esp32-multi/README.md)を追加しました。端末別の認証・通知異常はその端末だけを切断し、処理タスクの停止などは本体再起動で復旧を試みます。通常の無通信では発動しません。実機での復旧効果は未検証です。
 
+今回さらに、既知のLED要求だけへの自動応答、認証通知のキュー受付確認、通常ログの集計と書き込み後照合を追加しました。Advertisingの定期復旧と合わせ、詳細は[改修内容と検証範囲](pgpemu-esp32-multi/DESIGN.md#9-操作判別認証受付記録負荷の改善--request-classification-authentication-acceptance-and-logging)をご覧ください。LED判別の知見を公開した[spezifisch/pgpemu](https://github.com/spezifisch/pgpemu)にも感謝します。この追加修正の長時間・複数端末動作は未検証です。
+
 ## English
 
 This fork of [bentomo/PGP-Badge](https://github.com/bentomo/PGP-Badge) adds `pgpemu-esp32-multi` for up to three Pokémon GO BLE clients on **ESP32-WROOM-32**. The original single-client firmware remains in `pgpemu-esp32`. This is not an ESP32-C3 build.
@@ -31,3 +33,5 @@ The [bilingual design document](pgpemu-esp32-multi/DESIGN.md) describes per-clie
 You need the Bluetooth address, Device Key, and Blob from an **original Pokémon GO Plus you own**. The [bilingual setup guide](pgpemu-esp32-multi/README.md) covers equipment, PC environment, extraction risks and steps, local `secrets.c`, building, flashing, and log checks. Neither a usable `secrets.c` nor a firmware binary containing it is published here.
 
 The upstream [BSD 2-Clause license](LICENSE) and copyright notice are retained. Thanks to [Yohanes Nugroho](https://github.com/yohanes), [bentomo](https://github.com/bentomo/PGP-Badge), and the upstream contributors. The [original README](https://github.com/bentomo/PGP-Badge#readme) remains available upstream.
+
+Further improvements classify known LED requests before automatic button responses, check authentication queue acceptance, aggregate routine logs and verify flash writes by reading them back. Together with periodic advertising recovery, these are described in the [design document](pgpemu-esp32-multi/DESIGN.md). Thanks also to [spezifisch/pgpemu](https://github.com/spezifisch/pgpemu) for LED classification research. Long-duration multi-client behavior of these additional changes is not yet hardware-verified.
