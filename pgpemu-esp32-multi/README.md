@@ -117,6 +117,32 @@ Active clients: 3/3
 
 iPhoneを接続したままAndroid、その後3台目を接続し、全端末の接続表示とLEDの1→2→3台パターンを確認します。1台だけ切断したら、その`conn_id`の`Client disconnected`と接続数の減少、Advertising再開を確認します。残りの端末がPokémon GO上で接続済みのままか確かめ、切断した端末を再接続します。ログには機器アドレスや認証データが含まれ得るため、共有前に伏せてください。
 
+### 6. PCなしで診断ログを残し、帰宅後に取り出す
+
+3台使用中に全端末で自動操作が止まり、ESP32の再起動で復帰する症状を調査するため、本体フラッシュに診断ログを保存します。修正版では通知キューを端末別に分け、混雑中の待機と期限付き再試行を行います。接続番号が再利用されても以前の接続の操作は破棄します。症状の解消は実機ログで確認します。
+
+既存の環境で更新する場合は、改修版フォルダーで次を実行してください。ESP-IDF環境が有効なPowerShellを使います。
+
+```powershell
+idf.py menuconfig
+idf.py build
+idf.py -p COM3 flash monitor
+```
+
+`menuconfig`では**Partition Table → Partition Table → Custom partition table CSV**を選び、ファイル名を`partitions.csv`にして保存してからビルドします。古い`sdkconfig`がある場合、`sdkconfig.defaults`だけでは既存設定を上書きしません。起動時の`PGP_DIAG: Persistent diagnostics enabled: 512 KiB, previous boot retained`を確認したら、`Ctrl+]`でモニターを終了して外へ持ち出せます。この版は**アプリだけでなくパーティションテーブルも含む通常の`flash`**で書き込んでください。NVSとアプリの配置は従来と同じです。
+
+記録するのは接続・切断理由、認証状態の進行、通知購読、LEDコマンド、通知送信・再試行・期限切れ、混雑状態、30秒ごとの空きメモリとBLEイベント数です。認証のMAC・Device Key・Blob・session keyや認証ペイロードは保存しません。`NOTIFY_SENT`はBLEスタックに渡せたという意味で、捕獲成功の判定ではありません。
+
+問題が出たらESP32を再起動してかまいません。512KBを2つの領域に分け、再起動するたびに保存先を切り替えます。各領域は直近約1,024件を循環保存し、再起動前の領域は次の起動中に上書きしません。ただし再起動を重ねると古い起動の記録は上書きされます。電源を落とした瞬間にRAMキューに残っていた記録や、書き込み途中の最後の記録は失われる場合があります。`HEARTBEAT`内の`lost`はRAMキューが満杯で保存できなかった件数です。
+
+帰宅後、USB接続し、**シリアルモニターを閉じて**同じESP-IDF PowerShellで実行します。
+
+```powershell
+python .\tools\download-diagnostics.py --port COM3
+```
+
+診断領域だけを読み、`diagnostics-年月日-時分秒.txt`を現在のフォルダーに作ります。読み出しには少し時間がかかり、ESP32は前後でリセットされます。接続に失敗する場合は、書き込み時と同じBOOT操作を試してください。症状が出たおおよその時刻と、このテキストを解析用に渡してください。診断ログはGitの公開対象外です。取得前に`erase-flash`を行うと保存ログも消えるので実行しないでください。
+
 ### 謝辞・ライセンス
 
 [Yohanes Nugroho氏](https://github.com/yohanes/pgpemu)の解析と元コード、[bentomo氏とPGP-Badgeの貢献者](https://github.com/bentomo/PGP-Badge)のハードウェア／ESP32実装、[Jesus Bamford氏のSuota Go+](https://github.com/Jesus805/Suota-Go-Plus)の公開情報に感謝します。元コードの[BSD 2-Clauseライセンス](../LICENSE)と著作権表示を保持しています。Pokémon GOやESP-IDFの公式プロジェクトではありません。
@@ -212,6 +238,32 @@ The connection-count indicator has been observed on hardware. The blue LED indic
 Look for `advertising start successfully`, then `Client connected: conn_id=... slot=0`, `Active clients: 1/3`, and `Advertising restarted for next client`. The firmware's authentication progression should reach `conn_id=... cert_state=2 -> 6` (or `5 -> 6` on reconnect), **and Pokémon GO must also show connected**. Android long writes may log `prepare write conn_id=...` and `exec write conn_id=...`.
 
 Keep the iPhone connected, add Android, then a third phone; expect distinct `conn_id` and slots 0, 1, and 2, with `Active clients: 3/3`. Disconnect only one, check the remaining phones stay connected, advertising resumes, and the disconnected phone can reconnect. Redact addresses and authentication traffic before sharing logs.
+
+### 6. Record diagnostics without a PC and retrieve them later
+
+Persistent diagnostics help investigate all three clients stopping until an ESP32 restart. The revised sender uses per-client notification queues, congestion handling, bounded retries, and connection generations to discard stale operations. Field testing is still needed to establish whether these changes resolve the symptom.
+
+Activate ESP-IDF in PowerShell, then run in this project directory:
+
+```powershell
+idf.py menuconfig
+idf.py build
+idf.py -p COM3 flash monitor
+```
+
+In `menuconfig`, select **Partition Table → Partition Table → Custom partition table CSV**, set its filename to `partitions.csv`, and save. Defaults do not override an existing configuration. Confirm `PGP_DIAG: Persistent diagnostics enabled: 512 KiB, previous boot retained`, then exit with `Ctrl+]`. Use the full `flash` command to update both the application and partition table. Existing NVS and application offsets are preserved.
+
+Records contain connection/disconnection reasons, authentication state progression, subscriptions, LED commands, notification attempts/retries/expiry, congestion, and 30-second memory/BLE-event heartbeats. They exclude MAC addresses, Device Key, Blob, session keys, and authentication payloads. `NOTIFY_SENT` means accepted by the BLE stack, not successful capture.
+
+The 512-KiB partition has two circular banks, each holding roughly 1,024 recent records. Rebooting switches banks and preserves the previous boot's bank during the next run. Further reboots eventually overwrite older boots. Pending RAM records and a partially written final record may be lost on power removal. Heartbeat `lost` counts records dropped because the RAM queue was full.
+
+At home, connect USB, **close any serial monitor**, and use the ESP-IDF PowerShell:
+
+```powershell
+python .\tools\download-diagnostics.py --port COM3
+```
+
+The command reads only the diagnostic partition and creates a timestamped `diagnostics-*.txt` in the current directory. Reading takes some time and resets the board. If connection fails, use the same BOOT procedure as for flashing. Share the text and approximate incident time for analysis. Diagnostic exports are Git-ignored. Do not run `erase-flash` before retrieval, as it also erases the logs.
 
 ### Credits and license
 

@@ -1,3 +1,6 @@
 sdkconfig
 sdkconfig.old
 build
+diagnostics-*.txt
+diagnostics-*.bin
+__pycache__/
