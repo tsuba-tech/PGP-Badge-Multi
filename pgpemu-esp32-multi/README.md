@@ -155,6 +155,28 @@ python .\tools\download-diagnostics.py --port COM3
 
 診断領域だけを読み、`diagnostics-年月日-時分秒.txt`を現在のフォルダーに作ります。読み出しには少し時間がかかり、ESP32は前後でリセットされます。接続に失敗する場合は、書き込み時と同じBOOT操作を試してください。症状が出たおおよその時刻と、このテキストを解析用に渡してください。診断ログはGitの公開対象外です。取得前に`erase-flash`を行うと保存ログも消えるので実行しないでください。
 
+### 7. Watchdogによる監視と自動復旧
+
+2026-10-11にソフトウェア監視を追加しました。ビルド確認と実機動作確認は別で、この版の自動復旧と複数端末での長時間運用は実機検証が必要です。通常どおり`idf.py build`、`idf.py -p COM3 flash monitor`で更新します。Secretや保存ログを消す`erase-flash`は不要です。
+
+| 監視対象 | 復旧動作 |
+| --- | --- |
+| 通知タスク・監視タスクが10秒間進まない | タスクwatchdogで本体再起動。両CPUのidle監視も継続 |
+| 実行中のBLEコールバックが10秒戻らない | 本体再起動。BLEイベントが来ないだけでは発動しない |
+| 接続・認証開始から120秒で認証未完了、または認証購読中に状態が45秒進まない | 該当端末だけ切断して再接続待ち |
+| 認証通知1件の送信失敗が確定、または30秒の集計窓内でボタン通知3件が失敗 | 該当端末だけ切断。即時API失敗は従来どおり期限まで再試行し、期限切れ・満杯・非同期失敗を監視へ報告 |
+| 空きスロットがあるのにAdvertisingが開始できない | 停止確認後5秒、開始待ちなら20秒で再試行対象。監視側の再試行間隔は20秒以上 |
+| 全接続で切断要求が120秒完了しない | 本体再起動。他に正常な接続があれば本体を再起動しない |
+| BLE初期設定が120秒終わらない、または接続0台でAdvertising復旧が120秒以上進まない | 本体再起動 |
+
+認証済み端末の単なる無通信、ポケモンがいないこと、捕獲結果が来ないことは切断・再起動条件にしません。スマホの携帯回線状態やゲームサーバーの進行はESP32から直接監視できません。また、端末別の復旧は相手アドレスを指定するため、古い`conn_id`を別の端末が再利用してもその別端末を切断しません。
+
+起動時に`PGP_GUARD: Watchdog enabled: tasks=10s auto_restart=1`を確認してください。診断ログには`GUARD_BOOT`、`GUARD_CLOSE`、`GUARD_ADV_RETRY`、`GUARD_RESTART`を残します。watchdog停止時は直前のログが保存できない場合がありますが、次の起動のリセット理由と、監視タスクが計画した再起動理由はRTCメモリも使って記録します。
+
+短時間の自動再起動が3回続くと、その起動中はタスクwatchdogの強制再起動と監視タスクの本体再起動を抑止します。端末別復旧とAdvertising再試行は継続します。10分経過して既知の異常がない場合は次回起動向けの回数をリセットしますが、その起動中の抑止は解除しません。通常はUSBだけでなく別の電源も含めて電源を一度切ると回数がリセットされます。ハードウェアの割り込みwatchdog、panic、電源不良によるリセットまではこの抑止の対象にできません。
+
+ESP32はAdvertisingを再開できますが、**スマホへ再接続を強制することはできません**。アプリ側が自動で戻らなければPokémon GOの接続ボタンを押してください。本体再起動時は全端末が一度切断されます。LEDは引き続き接続台数だけを表示します。
+
 ### 謝辞・ライセンス
 
 [Yohanes Nugroho氏](https://github.com/yohanes/pgpemu)の解析と元コード、[bentomo氏とPGP-Badgeの貢献者](https://github.com/bentomo/PGP-Badge)のハードウェア／ESP32実装、[Jesus Bamford氏のSuota Go+](https://github.com/Jesus805/Suota-Go-Plus)の公開情報に感謝します。元コードの[BSD 2-Clauseライセンス](../LICENSE)と著作権表示を保持しています。Pokémon GOやESP-IDFの公式プロジェクトではありません。
@@ -286,6 +308,28 @@ python .\tools\download-diagnostics.py --port COM3
 ```
 
 The command reads only the diagnostic partition and creates a timestamped `diagnostics-*.txt` in the current directory. Reading takes some time and resets the board. If connection fails, use the same BOOT procedure as for flashing. Share the text and approximate incident time for analysis. Diagnostic exports are Git-ignored. Do not run `erase-flash` before retrieval, as it also erases the logs.
+
+### 7. Watchdog monitoring and automatic recovery
+
+Software supervision was added on 2026-10-11. Build checks do not establish hardware recovery behavior or long-duration multi-client stability. Update with `idf.py build` and `idf.py -p COM3 flash monitor`; do not use `erase-flash`.
+
+| Condition | Action |
+| --- | --- |
+| Notification/supervisor task fails to complete a pass for 10 s | Task watchdog restarts the ESP32; both CPU idle tasks remain monitored |
+| An executing BLE callback does not return for 10 s | Restart; absence of BLE events alone does not trigger recovery |
+| Authentication incomplete 120 s after connection/authentication restart, or no state progress for 45 s while certificate notifications are enabled | Disconnect only the affected peer |
+| One failed certificate notification, or three failed button notifications within a 30-s counting window | Disconnect that peer; immediate API failures retain existing bounded retries, with expiry, overflow and asynchronous failures reported to supervision |
+| Advertising missing with spare capacity | Eligible after 5 s inactive or 20 s pending; supervisor retries are at least 20 s apart |
+| Every remaining client's close request remains incomplete for 120 s | Restart; one unhealthy peer does not trigger this restart while another link remains healthy |
+| BLE setup incomplete for 120 s, or advertising recovery stuck for 120 s with zero clients | Restart |
+
+Authenticated-client inactivity, absence of Pokémon, and missing capture results are not faults. The ESP32 cannot directly monitor the phone's internet connection or server progress. Peer recovery targets its Bluetooth address, not a potentially reused connection ID.
+
+Look for `PGP_GUARD: Watchdog enabled: tasks=10s auto_restart=1` at boot. Persistent records include `GUARD_BOOT`, `GUARD_CLOSE`, `GUARD_ADV_RETRY`, and `GUARD_RESTART`. The final records before a watchdog reset may be lost; the next boot records reset reason and uses retained RTC metadata for supervisor-planned restart causes.
+
+After three consecutive automatic resets, task-watchdog panic and supervisor global restarts are suppressed for that boot. Peer recovery and advertising retries continue. After ten minutes without a known fault, the next-boot reset counter is cleared, but suppression remains for the current boot. Removing all board power normally clears the retained counter. Interrupt-watchdog, unrelated panic, and power-failure resets are outside this suppression mechanism.
+
+The ESP32 can resume advertising but **cannot force the phone to reconnect**. Tap the connection control in Pokémon GO if the app does not reconnect. A global reset disconnects every phone. The blue LED continues to show connection count only.
 
 ### Credits and license
 

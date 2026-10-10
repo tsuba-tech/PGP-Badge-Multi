@@ -14,6 +14,8 @@
 
 接続別の状態管理、通知の再試行、保存ログの構造と制約は[設計書（日本語・英語）](pgpemu-esp32-multi/DESIGN.md)にまとめています。2026-10-10の修正版は、実機への書き込み・起動、保存ログ機能の有効化、Advertising開始まで確認済みです。3台使用時の停止症状が解消したという意味ではありません。
 
+2026-10-11に[Watchdogと段階的な自動復旧](pgpemu-esp32-multi/README.md)を追加しました。端末別の認証・通知異常はその端末だけを切断し、処理タスクの停止などは本体再起動で復旧を試みます。通常の無通信では発動しません。実機での復旧効果は未検証です。
+
 ## English
 
 This fork of [bentomo/PGP-Badge](https://github.com/bentomo/PGP-Badge) adds `pgpemu-esp32-multi` for up to three Pokémon GO BLE clients on **ESP32-WROOM-32**. The original single-client firmware remains in `pgpemu-esp32`. This is not an ESP32-C3 build.
@@ -21,6 +23,8 @@ This fork of [bentomo/PGP-Badge](https://github.com/bentomo/PGP-Badge) adds `pgp
 **Status:** The original single-client version reached "connected" in Pokémon GO on an iPhone with ESP32-WROOM-32. The multi-client variant builds and flashes with ESP-IDF 4.4.8; logs show three connections progressing through authentication, and the blue GPIO2 connection-count indicator was observed. Simultaneous connected status in all three Pokémon GO apps, mixed iPhone/Android operation, and disconnect isolation still need confirmation.
 
 All three clients have been reported to stop automatic actions until an ESP32 restart. Notification handling improvements and persistent diagnostics for later USB retrieval have been added; their effectiveness is undergoing field testing. See the diagnostics section of the [setup guide](pgpemu-esp32-multi/README.md).
+
+Watchdog supervision and staged recovery were added on 2026-10-11: authentication/notification faults disconnect only the affected peer, while stalled execution can trigger an ESP32 restart. Ordinary inactivity is not a fault. Recovery effectiveness remains unverified on hardware; see the [setup guide](pgpemu-esp32-multi/README.md).
 
 The [bilingual design document](pgpemu-esp32-multi/DESIGN.md) describes per-client state, notification retries, diagnostic storage, and limitations. On 2026-10-10, the revised firmware was successfully flashed and booted on hardware, enabled persistent diagnostics, and started advertising. This does not establish that the three-client stall has been resolved.
 

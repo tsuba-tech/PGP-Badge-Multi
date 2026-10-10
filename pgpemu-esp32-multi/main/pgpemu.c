@@ -21,6 +21,7 @@
 #include "pgp-cert.h"
 #include "secrets.h"
 #include "pgp-diag.h"
+#include "pgp-guard.h"
 #include "esp_timer.h"
 #include "esp_gatt_common_api.h"
 
@@ -53,6 +54,8 @@
 #define MAX_PGP_CLIENTS             3
 #define STATUS_LED_GPIO             GPIO_NUM_2
 #define STATUS_LED_ACTIVE_LEVEL     1
+
+_Static_assert(MAX_PGP_CLIENTS == PGP_GUARD_CLIENTS, "Guard slot count must match");
 
 #if CONFIG_BTDM_CTRL_BLE_MAX_CONN < MAX_PGP_CLIENTS
 #error "CONFIG_BTDM_CTRL_BLE_MAX_CONN must be at least 3"
@@ -140,6 +143,8 @@ static void sync_notification_client(pgp_client_t *client)
         .congested = client->congested,
     };
     portEXIT_CRITICAL(&notification_lock);
+    pgp_guard_client(slot, client->used, client->conn_id, client->remote_bda,
+                     client->generation, client->cert_state, client->cert_notify_enabled);
 }
 
 static void queue_certificate(esp_gatt_if_t gatts_if, uint16_t conn_id,
@@ -518,6 +523,7 @@ static void log_cert_transition(pgp_client_t *client, int next_state)
     ESP_LOGI(GATTS_TABLE_TAG, "conn_id=%u cert_state=%d -> %d",
              client->conn_id, client->cert_state, next_state);
     client->cert_state = next_state;
+    sync_notification_client(client);
 }
 
 static void generate_first_challenge(pgp_client_t *client)
@@ -539,6 +545,7 @@ static void generate_first_challenge(pgp_client_t *client)
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
+    pgp_guard_ble_enter();
     pgp_diag_ble_event();
     switch (event) {
         case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
@@ -606,6 +613,9 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             break;
     }
     pgp_diag_status(active_client_count(), advertising, advertising_start_pending);
+    pgp_guard_advertising(adv_config_done == 0, advertising, advertising_start_pending,
+                          active_client_count());
+    pgp_guard_ble_exit();
 }
 
 void pgp_prepare_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param)
@@ -1106,6 +1116,11 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             if (param->conf.status != ESP_GATT_OK) {
                 pgp_diag_log("NOTIFY_ASYNC_FAIL conn=%u handle=%u status=%d", param->conf.conn_id,
                              param->conf.handle, param->conf.status);
+                pgp_client_t *client = get_client(param->conf.conn_id);
+                if (client != NULL) {
+                    pgp_guard_tx_failure(client_slot(client), client->generation,
+                        param->conf.handle == certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL]);
+                }
             }
             ESP_LOGD(GATTS_TABLE_TAG, "ESP_GATTS_CONF_EVT, status = %d", param->conf.status);
             break;
@@ -1229,6 +1244,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
+    pgp_guard_ble_enter();
     pgp_diag_ble_event();
 
     /* If event is register event, store the gatts_if for each profile */
@@ -1239,6 +1255,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             ESP_LOGE(GATTS_TABLE_TAG, "reg app failed, app_id %04x, status %d",
                     param->reg.app_id,
                     param->reg.status);
+            pgp_guard_ble_exit();
             return;
         }
     }
@@ -1254,6 +1271,9 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         }
     } while (0);
     pgp_diag_status(active_client_count(), advertising, advertising_start_pending);
+    pgp_guard_advertising(adv_config_done == 0, advertising, advertising_start_pending,
+                          active_client_count());
+    pgp_guard_ble_exit();
 }
 
 
@@ -1282,6 +1302,7 @@ static void queue_notification(int slot, bool certificate, const uint8_t *data, 
     };
     memcpy(event.data, data, len);
     if (xQueueSend(notification_queues[slot], &event, 0) != pdTRUE) {
+        pgp_guard_tx_failure(slot, target.generation, certificate);
         pgp_diag_log("NOTIFY_QUEUE_FULL conn=%u gen=%lu cert=%d", target.conn_id,
                      (unsigned long)target.generation, certificate);
         ESP_LOGW(GATTS_TABLE_TAG, "Notification queue full conn_id=%u", target.conn_id);
@@ -1297,6 +1318,7 @@ static void broadcast_button(const uint8_t *data, size_t len)
 
 static void notification_task(void *pvParameters)
 {
+    pgp_guard_watch_current_task();
     notification_event_t pending[MAX_PGP_CLIENTS];
     bool occupied[MAX_PGP_CLIENTS] = {0};
     unsigned attempts[MAX_PGP_CLIENTS] = {0};
@@ -1324,6 +1346,9 @@ static void notification_task(void *pvParameters)
                 drop_reason = "expired";
             }
             if (drop_reason != NULL) {
+                if (strcmp(drop_reason, "expired") == 0) {
+                    pgp_guard_tx_failure(slot, event->target.generation, event->certificate);
+                }
                 pgp_diag_log("NOTIFY_DROP conn=%u gen=%lu cert=%d reason=%s attempts=%u",
                              event->target.conn_id, (unsigned long)event->target.generation,
                              event->certificate, drop_reason, attempts[slot]);
@@ -1369,6 +1394,7 @@ static void notification_task(void *pvParameters)
             }
             report_at = now + 30000000LL;
         }
+        pgp_guard_task_progress();
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -1521,6 +1547,7 @@ void app_main()
         configASSERT(notification_queues[i] != NULL);
     }
     pgp_diag_init();
+    pgp_guard_init(&adv_params);
     status_led_queue = xQueueCreate(1, sizeof(uint8_t));
     configASSERT(status_led_queue != NULL);
     gpio_config_t status_led_config = {

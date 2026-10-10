@@ -116,6 +116,47 @@ Run `python tools/download-diagnostics.py --port COM3` in the ESP-IDF environmen
 
 Do not publish real `main/secrets.c`, extracted JSON, device-specific build artifacts, or diagnostic exports. Persistent records exclude MAC addresses, Device Key, Blob, session keys and authentication payloads. Ordinary serial output may contain device/authentication information and must be reviewed before sharing.
 
-本変更は停止の原因を実機で確定したものではない。通知期限切れや非同期送信失敗は接続・認証のやり直しを必要とする場合がある。Advertising開始APIの即時失敗に対する周期的な自動復旧はない。世代番号の再確認と送信API呼び出しは一体の原子的操作ではない。フラッシュ記録によるBLEタイミングへの影響も実機評価が必要。これらは今後のログ解析と検証対象とする。
+本変更は停止の原因を実機で確定したものではない。通知期限切れや非同期送信失敗は接続・認証のやり直しを必要とする場合がある。Advertising開始APIの即時失敗に対する周期的な復旧は、以下の監視モジュールが補う。世代番号の再確認と送信API呼び出しは一体の原子的操作ではない。フラッシュ記録によるBLEタイミングへの影響も実機評価が必要。これらは今後のログ解析と検証対象とする。
 
-The root cause of the stall has not been established on hardware. Expired authentication notifications or asynchronous failures may require reconnecting. There is no periodic recovery for an immediate advertising-start API failure. Generation validation and the subsequent send API call are not one atomic operation. Flash logging's impact on BLE timing also needs hardware evaluation. These remain targets for field logs and further testing.
+The root cause of the stall has not been established on hardware. Expired authentication notifications or asynchronous failures may require reconnecting. The supervisor below supplies periodic recovery after immediate advertising-start API failures. Generation validation and the subsequent send API call are not one atomic operation. Flash logging's impact on BLE timing also needs hardware evaluation. These remain targets for field logs and further testing.
+
+## 8. Watchdogと段階復旧 / Watchdog and staged recovery
+
+2026-10-11追加の`main/pgp-guard.c`は、接続管理用構造体そのものではなく、短いクリティカルセクションで保護する監視専用コピーを持つ。BLEコールバックが接続・世代・認証状態・購読・Advertising状態を更新し、通知処理が確定した送信失敗を報告する。監視タスクは優先度4、1秒周期。BLE API呼び出しはロック外で行う。
+
+Added on 2026-10-11, `main/pgp-guard.c` owns supervision-only copies protected by short critical sections. BLE callbacks update lifecycle/authentication/advertising state; notification paths report definitive failures. The priority-4 supervisor runs once per second and calls BLE APIs outside the lock.
+
+通知タスクと監視タスクはタスクwatchdogへ個別登録し、一巡した後だけ更新する。既存`sdkconfig`でも実行時に10秒・panic有効を設定する（再起動抑止時はpanic無効）。両CPUのidle監視は既存設定を維持する。BLEコールバックは開始／終了を記録し、実行中のコールバックが10秒戻らない場合は監視タスクが本体再起動を要求する。無イベントの時間は監視対象にしない。
+
+Notification and supervisor tasks subscribe individually to the task watchdog and feed it only after a completed pass. Runtime configuration sets a 10-s timeout and enables panic unless reset-loop protection is active; existing CPU idle subscriptions remain. Callback entry/exit tracking detects a callback executing for 10 s, not absence of incoming events.
+
+接続または認証再開始から120秒で認証未完了、認証購読中に状態が45秒進まない、認証通知が1件失敗、ボタン通知が30秒の窓内で3件失敗、のいずれかで端末別復旧へ進む。失敗はキュー満杯、送信期限切れ、非同期エラーが対象。即時APIエラーは通知タスクが有効期限まで再試行する。購読OFF・古い世代の通知破棄は異常に数えない。認証済み端末の無通信時間は制限しない。
+
+Peer recovery triggers on incomplete setup after 120 s, stalled subscribed authentication after 45 s, one failed certificate notification, or three failed button notifications within a 30-s counting window. Overflow, expiry and asynchronous errors count; immediate API errors retain bounded sender retries. Disabled subscriptions and stale generations do not count as faults. Authenticated inactivity has no timeout.
+
+監視スロットの世代を再確認した上で、相手アドレス指定の`esp_ble_gap_disconnect`を呼ぶ。接続番号の再利用によって別端末を切断しないためである。同じ端末が検証直後に再接続する競合はなおあり得る。切断要求は15秒間隔で最大3回。全ての残存接続で最初の切断要求から120秒経っても切断が完了しない場合に限り、この経路で本体を再起動する。正常な別接続がある場合は本体を再起動しない。
+
+After generation validation, recovery uses address-targeted `esp_ble_gap_disconnect`, avoiding disconnection of a different peer that reuses a connection ID. A same-peer reconnect can still race validation. Up to three disconnect requests are spaced 15 s apart. This recovery path escalates to global restart only when every remaining link has failed to disconnect for 120 s; a healthy remaining link prevents escalation.
+
+Advertisingの空きがあって停止中なら5秒、開始待ちなら20秒で再試行対象とし、監視側の要求間隔は20秒以上。BLE初期設定が120秒完了しない場合、または接続0台でAdvertising復旧が120秒以上進まない場合は本体再起動の対象とする。端末が接続中ならAdvertisingだけの異常では本体を再起動しない。実際のスマホの再接続開始はアプリ側に依存する。
+
+Missing advertising becomes eligible for retry after 5 s inactive or 20 s pending, with supervisor requests at least 20 s apart. Incomplete BLE setup after 120 s, or stalled advertising recovery for 120 s with zero clients, can restart the ESP32. Advertising failure alone does not restart it with connected clients. Phone reconnection initiation remains app-controlled.
+
+RTCの未初期化領域にmagic・連続自動リセット回数・計画再起動フラグ・理由を保持する。3回の連続自動リセット後、その起動ではタスクwatchdogのpanicと監視タスクの全体再起動を抑止する。端末別復旧は継続する。起動後10分かつ既知の異常なしで次回向け回数をリセットするが、その起動の抑止は解除しない。割り込みwatchdogや別のpanicはこの上限で抑止しない。RTC保持は電源断を越える永続保存ではない。
+
+RTC no-init memory retains magic, consecutive automatic-reset count, planned-restart flag and cause. Three consecutive automatic resets suppress task-watchdog panic and supervisor global restarts for that boot, while peer recovery continues. After ten minutes without a known fault, the next-boot counter is renewed without lifting current suppression. Interrupt-watchdog and unrelated panic resets are not suppressed; RTC data does not survive complete power removal.
+
+`GUARD_BOOT`の`cause`は0=計画理由なし、1=BLEコールバック停止、2=全接続の切断未完了、3=Advertising復旧停止、4=BLE初期設定停止。タスクwatchdogによる再起動は`reset`でも識別する。再起動直前のフラッシュログ保存はbest effortであり、RTCと次回起動記録で補う。新モジュールの実機復旧・誤検知・長時間運用は未検証である。
+
+In `GUARD_BOOT`, `cause` is 0=no planned cause, 1=stalled callback, 2=all disconnects stalled, 3=advertising recovery stalled, 4=BLE setup stalled. Task-watchdog resets are identified by `reset`. Pre-reset flash logging is best effort, supplemented by RTC and next-boot records. Hardware recovery, false-positive behavior and long-duration operation of this module remain unverified.
+
+### 実機で確認する項目 / Hardware acceptance checks
+
+1. 2台→3台を接続し、認証完了後の無操作状態でも切断しないことを確認する。
+2. 1台だけ認証を途中で止め、45秒／120秒の復旧が他端末を切断しないことを確認する。
+3. テスト用ビルドで通知タスクを停止し、watchdog再起動と次回のリセット理由を確認する。通常配布版には故障注入コマンドを含めない。
+4. Advertising開始失敗と切断要求未完了をテスト用ビルドで注入し、再試行・全体復旧条件を確認する。
+5. 短時間にwatchdog再起動を3回発生させ、4回目が抑止されること、完全な電源OFFで解除されることを確認する。
+6. 回線不良と対象なしの状況で誤切断しないこと、保存ログの取得ができることを確認する。
+
+Test idle authenticated operation with two then three phones; isolate an intentionally stalled handshake; inject notification-task, advertising and disconnect faults in a test-only build; verify reset reasons, three-reset loop protection and full-power-cycle recovery; confirm poor phone connectivity/absence of targets does not trigger false disconnects, and retrieve saved diagnostics. Fault injection is not enabled in normal firmware.
