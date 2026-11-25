@@ -199,6 +199,30 @@ CコードのLED分類・認証遷移と診断デコーダーをホスト上で�
 
 `TX_HEALTH`と`CLIENT_SUMMARY`に`miss`（期限内に送れなかった押下）、`dup`（まとめた重複要求）、`rearm`（押し直し）、`win`（直近の押下期限ms）を追加しました。`miss`が増える場合は混雑か電波状態を疑ってください。再接続用の認証（state 4）は36バイト未満の入力を受け付けないようにしました。
 
+### 10. 押し方・設定・お知らせLED（2026-11-25）
+
+**押し方（遅延）**：他のオープンソース実装（spezifisch/pgpemu系、ESP32-PoGoPP-Emuなど）にならい、即押しをやめました。既定は**高速**で、要求から0.3〜0.8秒後にランダムに押し、押す長さも250〜500msでランダムにします。`m`で「高速 → 通常（1.0〜2.5秒）→ 即時（元の動作）」と切り替えられます。これは人の操作に近づけるための工夫で、利用規約違反の検出を避けられる保証はありません。
+
+**ボール切れ時の補充**：ポケモンへの押下のあとに赤点滅（ボール切れ）が来たら、ポケストップを既定で10回回すまで捕獲の押下を止めます。同じ赤点滅でもポケストップのあとなら「圏外」と判断し、何もしません。補充中にバッグ満杯になったら、待ち続けないよう補充をやめて捕獲に戻ります。回収をOFFにしている場合は補充モードに入りません。
+
+**お知らせLED（GPIO2）**：接続台数の表示（3秒周期）の後半で、問題があれば点滅します。ボックス満杯は速い点滅（0.1秒）、ボール切れは中くらい（0.2秒）、バッグ満杯はゆっくり（0.3秒）です。捕獲・回収に成功するか切断すると消えます。
+
+**設定方法（PCのシリアル）**：`idf.py -p COM3 monitor`を開き、文字を打ってEnterを押します。`c`・`s`・`m`・`n`で変えた値はNVSに保存され、再起動後も残ります。
+
+| コマンド | 内容 |
+| --- | --- |
+| `h` | コマンド一覧 |
+| `l` | 接続中の端末ごとの状態（認証、捕獲/回収、補充の残り回数、お知らせ、押下・捕獲・逃走・回収・押し損ね・見送りの数） |
+| `c` / `s` | 捕獲 / 回収のON/OFF（既定値と接続中の全端末、保存） |
+| `1c`、`2s`など | その端末（スロット番号）だけ切り替え。切断まで有効で保存しません |
+| `m` | 押し方：高速 → 通常 → 即時（保存） |
+| `n10` | ボール切れ時に回すポケストップの数（`n0`で補充モードなし、最大99、保存） |
+| `1r` | スロット1の補充待ちをやめて、すぐ捕獲に戻す |
+| `a` | お知らせLEDを消す |
+| `q` / `w` | 全端末へ手動で押す / 離す（Enter不要） |
+
+スロット番号は接続順に空いている番号が割り当てられます。iPhoneはBluetoothアドレスが変わるため、端末ごとの設定は保存せず、接続中だけ有効にしています。接続中は Advertising を100〜200ms間隔に落とし、スマホへ30〜60msの接続間隔を要求して、3台分の電波の時間に余裕を作っています。`TX_HEALTH`には`skip`（設定や補充中で押さなかった要求数）を追加しました。
+
 ### 謝辞・ライセンス
 
 LEDコマンドの判別には[spezifisch/pgpemu](https://github.com/spezifisch/pgpemu/blob/master/pgpemu-esp32/main/pgp_led_handler.c)の知見を利用しています。Yohanes Nugroho氏、spezifisch氏にも感謝します。この部分のBSD 2-Clause著作権・ライセンス表示は[main/LICENSE.LED](main/LICENSE.LED)に保持しています。
@@ -376,6 +400,30 @@ Host tests exercise the production LED classifier, authentication transition con
 - Authentication notifications are sent before button presses.
 
 `TX_HEALTH` and `CLIENT_SUMMARY` gain `miss`, `dup`, `rearm` and `win` (latest press window in ms). A rising `miss` points to congestion or poor radio conditions. Reconnect authentication (state 4) now rejects inputs shorter than 36 bytes.
+
+### 10. Press timing, settings and alert LED (2026-11-25)
+
+**Press timing**: like other open-source catchers (spezifisch/pgpemu forks, ESP32-PoGoPP-Emu), presses are no longer instant. The default **fast** mode presses 0.3–0.8 s after the request with a random 250–500 ms hold. `m` cycles fast → normal (1.0–2.5 s) → instant (original behavior). This only resembles human timing; it is no guarantee against terms-of-service enforcement.
+
+**Restocking when out of balls**: blinking red after a Pokémon request means no balls, so catching pauses until 10 Pokéstops (default) have been spun. The same pattern after a Pokéstop request means out of range and is ignored. A full bag ends restocking instead of waiting forever. With spinning off, restocking never starts.
+
+**Alert LED (GPIO2)**: the second half of the 3-s connection-count cycle blinks when a phone reports a problem: box full fast (0.1 s), no balls medium (0.2 s), bag full slow (0.3 s). A successful catch/spin or a disconnect clears it.
+
+**Settings over the PC serial port**: open `idf.py -p COM3 monitor`, type a command and press Enter. `c`, `s`, `m` and `n` are saved to NVS and survive restarts.
+
+| Command | Action |
+| --- | --- |
+| `h` | Help |
+| `l` | Per-phone status: authentication, catch/spin, restock left, alerts, pressed/caught/fled/spun/missed/skipped |
+| `c` / `s` | Toggle catching / spinning (default and all connected phones, saved) |
+| `1c`, `2s`, ... | Toggle for that slot only, until it disconnects (not saved) |
+| `m` | Press timing: fast → normal → instant (saved) |
+| `n10` | Pokéstops to spin after running out of balls (`n0` disables, max 99, saved) |
+| `1r` | Slot 1: stop restocking and catch again now |
+| `a` | Clear alert LED |
+| `q` / `w` | Manually press / release on all phones (no Enter) |
+
+Slots are assigned in connection order. Per-phone settings are not saved because iPhones change their Bluetooth address. While phones are connected, advertising slows to 100–200 ms and phones are asked for 30–60 ms connection intervals to leave radio time for three links. `TX_HEALTH` gains `skip` (requests not pressed because of settings or restocking).
 
 ### Credits and license
 

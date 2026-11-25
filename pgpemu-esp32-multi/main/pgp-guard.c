@@ -48,6 +48,7 @@ static RTC_NOINIT_ATTR reboot_record_t reboot_record;
 static portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
 static guarded_client_t links[PGP_GUARD_CLIENTS];
 static esp_ble_adv_params_t advertising_params;
+static esp_ble_adv_params_t advertising_params_connected;
 static bool adv_ready, adv_active, adv_pending;
 static int connected_count;
 static int64_t adv_changed_at, adv_retry_at;
@@ -252,8 +253,10 @@ static void guard_task(void *unused)
         }
 
         bool retry_advertising = false, setup_stalled, advertising_stalled, ready;
+        int clients_now;
         portENTER_CRITICAL(&lock);
         ready = adv_ready;
+        clients_now = connected_count;
         setup_stalled = !adv_ready && now >= SETUP_TIMEOUT_US;
         advertising_stalled = adv_ready && !adv_active && connected_count == 0 &&
             adv_failure_since && now - adv_failure_since >= SETUP_TIMEOUT_US;
@@ -274,7 +277,9 @@ static void guard_task(void *unused)
         }
         if (retry_advertising) {
             /* Does not touch authentication, slots, or existing connections. */
-            esp_err_t err = esp_ble_gap_start_advertising(&advertising_params);
+            /* Same speed choice as the main code: fast only with no phone connected. */
+            esp_err_t err = esp_ble_gap_start_advertising(clients_now ? &advertising_params_connected :
+                                                          &advertising_params);
             pgp_diag_log("GUARD_ADV_RETRY result=%s", esp_err_to_name(err));
             ESP_LOGW(TAG, "Advertising recovery: %s", esp_err_to_name(err));
         }
@@ -291,7 +296,8 @@ static void guard_task(void *unused)
     }
 }
 
-void pgp_guard_init(const esp_ble_adv_params_t *params)
+void pgp_guard_init(const esp_ble_adv_params_t *params,
+                    const esp_ble_adv_params_t *connected_params)
 {
     esp_reset_reason_t reset = esp_reset_reason();
     bool retained = reboot_record.magic == RTC_MAGIC &&
@@ -310,6 +316,7 @@ void pgp_guard_init(const esp_ble_adv_params_t *params)
     reboot_record.restart_cause = 0;
     restart_allowed = reboot_record.repeated_resets < 3;
     advertising_params = *params;
+    advertising_params_connected = *connected_params;
     initialized = true;
     /* Explicit runtime configuration also applies to existing sdkconfig files. */
     ESP_ERROR_CHECK(esp_task_wdt_init(TASK_TIMEOUT_S, restart_allowed));

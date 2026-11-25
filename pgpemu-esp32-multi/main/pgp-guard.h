@@ -8,7 +8,8 @@
 
 #define PGP_GUARD_CLIENTS 3
 
-void pgp_guard_init(const esp_ble_adv_params_t *params);
+void pgp_guard_init(const esp_ble_adv_params_t *params,
+                    const esp_ble_adv_params_t *connected_params);
 void pgp_guard_client(int slot, bool used, uint16_t conn, const esp_bd_addr_t remote,
                       uint32_t generation, int cert_state, bool cert_enabled);
 void pgp_guard_advertising(bool ready, bool active, bool pending, int clients);

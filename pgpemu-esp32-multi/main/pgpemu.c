@@ -24,6 +24,8 @@
 #include "pgp-guard.h"
 #include "pgp-led.h"
 #include "pgp-button.h"
+#include "pgp-auto.h"
+#include "nvs.h"
 #include "esp_timer.h"
 #include "esp_gatt_common_api.h"
 
@@ -119,6 +121,7 @@ typedef struct {
     bool cert_enabled;
     bool button_enabled;
     bool congested;
+    int cert_state;
 } notification_client_t;
 
 typedef struct {
@@ -140,15 +143,26 @@ typedef struct {
     uint32_t sent_button, sent_cert;
     uint32_t requests, caught, fled, spun, errors, off, unknown;
     uint32_t missed, merged, rearmed, window_ms;
+    uint32_t skipped;   /* requests not pressed because of settings or restocking */
 } client_counters_t;
 static client_counters_t client_counters[MAX_PGP_CLIENTS];
 /* Guarded by notification_lock: written by BLE callbacks and the notification task. */
 static pgp_button_request_t button_requests[MAX_PGP_CLIENTS];
 static pgp_button_request_t button_last_sent[MAX_PGP_CLIENTS];
 static QueueHandle_t status_led_queue;
+/* Automation policy. auto_lock guards the settings and per-client state, which
+ * BLE callbacks and the UART command task both touch. */
+static portMUX_TYPE auto_lock = portMUX_INITIALIZER_UNLOCKED;
+static pgp_auto_settings_t auto_settings = {
+    .catch_enabled = true, .spin_enabled = true, .press_mode = PGP_PRESS_FAST,
+    .restock_spins = PGP_AUTO_RESTOCK_DEFAULT,
+};
+static pgp_auto_client_t auto_clients[MAX_PGP_CLIENTS];
+static volatile uint8_t status_alerts;
 static int active_client_count(void);
 static bool queue_notification(int slot, bool certificate, const uint8_t *data, size_t len);
-static void request_button(int slot, const uint8_t *data, size_t len, uint32_t window_ms);
+static void request_button(int slot, const uint8_t *data, size_t len,
+                           uint32_t delay_ms, uint32_t window_ms);
 static void rearm_button_after_failure(int slot, uint32_t generation);
 static void reset_button_slot(int slot);
 
@@ -162,6 +176,7 @@ static void sync_notification_client(pgp_client_t *client)
         .cert_enabled = client->cert_notify_enabled,
         .button_enabled = client->button_notify_enabled,
         .congested = client->congested,
+        .cert_state = client->cert_state,
     };
     portEXIT_CRITICAL(&notification_lock);
     pgp_guard_client(slot, client->used, client->conn_id, client->remote_bda,
@@ -192,6 +207,13 @@ static bool queue_certificate(esp_gatt_if_t gatts_if, uint16_t conn_id,
 
 static void update_status_led(void)
 {
+    uint8_t alerts = 0;
+    portENTER_CRITICAL(&auto_lock);
+    for (int i = 0; i < MAX_PGP_CLIENTS; ++i) {
+        alerts |= clients[i].used ? auto_clients[i].alerts : 0;
+    }
+    portEXIT_CRITICAL(&auto_lock);
+    status_alerts = alerts;
     if (status_led_queue != NULL) {
         uint8_t count = active_client_count();
         xQueueOverwrite(status_led_queue, &count);
@@ -216,6 +238,8 @@ static uint8_t raw_scan_rsp_data[] = {
 };
 
 
+/* Fast advertising (20-40 ms) only while nobody is connected. With phones
+ * connected, 100-200 ms leaves radio time for their connection events. */
 static esp_ble_adv_params_t adv_params = {
     .adv_int_min         = 0x20,
     .adv_int_max         = 0x40,
@@ -224,6 +248,15 @@ static esp_ble_adv_params_t adv_params = {
     .channel_map         = ADV_CHNL_ALL,
     .adv_filter_policy   = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
+static esp_ble_adv_params_t adv_params_connected = {
+    .adv_int_min         = 0xA0,
+    .adv_int_max         = 0x140,
+    .adv_type            = ADV_TYPE_IND,
+    .own_addr_type       = BLE_ADDR_TYPE_PUBLIC,
+    .channel_map         = ADV_CHNL_ALL,
+    .adv_filter_policy   = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+};
+static bool advertising_fast;
 
 struct gatts_profile_inst {
     esp_gatts_cb_t gatts_cb;
@@ -498,6 +531,9 @@ static pgp_client_t *create_client(uint16_t conn_id, esp_gatt_if_t gatts_if,
             client_counters[i] = (client_counters_t){.generation = clients[i].generation};
             portEXIT_CRITICAL(&notification_lock);
             reset_button_slot(i);
+            portENTER_CRITICAL(&auto_lock);
+            pgp_auto_reset(&auto_clients[i], &auto_settings);
+            portEXIT_CRITICAL(&auto_lock);
             memcpy(clients[i].remote_bda, remote_bda, sizeof(esp_bd_addr_t));
             xQueueReset(notification_queues[i]);
             sync_notification_client(&clients[i]);
@@ -526,12 +562,13 @@ static int delete_client(uint16_t conn_id)
     portENTER_CRITICAL(&notification_lock);
     client_counters_t summary = client_counters[slot];
     portEXIT_CRITICAL(&notification_lock);
-    pgp_diag_log("CLIENT_SUMMARY conn=%u gen=%lu button=%lu cert=%lu request=%lu caught=%lu fled=%lu spun=%lu error=%lu off=%lu unknown=%lu miss=%lu dup=%lu rearm=%lu",
+    pgp_diag_log("CLIENT_SUMMARY conn=%u gen=%lu button=%lu cert=%lu request=%lu caught=%lu fled=%lu spun=%lu error=%lu off=%lu unknown=%lu miss=%lu dup=%lu rearm=%lu skip=%lu",
         conn_id, (unsigned long)summary.generation, (unsigned long)summary.sent_button,
         (unsigned long)summary.sent_cert, (unsigned long)summary.requests,
         (unsigned long)summary.caught, (unsigned long)summary.fled, (unsigned long)summary.spun,
         (unsigned long)summary.errors, (unsigned long)summary.off, (unsigned long)summary.unknown,
-        (unsigned long)summary.missed, (unsigned long)summary.merged, (unsigned long)summary.rearmed);
+        (unsigned long)summary.missed, (unsigned long)summary.merged, (unsigned long)summary.rearmed,
+        (unsigned long)summary.skipped);
     if (client->prepare_write_env.prepare_buf != NULL) {
         free(client->prepare_write_env.prepare_buf);
     }
@@ -539,6 +576,10 @@ static int delete_client(uint16_t conn_id)
     sync_notification_client(client);
     xQueueReset(notification_queues[slot]);
     reset_button_slot(slot);
+    portENTER_CRITICAL(&auto_lock);
+    auto_clients[slot].alerts = 0;
+    auto_clients[slot].restock_remaining = 0;
+    portEXIT_CRITICAL(&auto_lock);
     return slot;
 }
 
@@ -548,9 +589,12 @@ static void start_advertising_if_available(const char *reason)
         active_client_count() >= MAX_PGP_CLIENTS) {
         return;
     }
-    esp_err_t err = esp_ble_gap_start_advertising(&adv_params);
-    pgp_diag_log("ADV_REQUEST clients=%d result=%s", active_client_count(), esp_err_to_name(err));
+    bool fast = active_client_count() == 0;
+    esp_err_t err = esp_ble_gap_start_advertising(fast ? &adv_params : &adv_params_connected);
+    pgp_diag_log("ADV_REQUEST clients=%d fast=%d result=%s", active_client_count(), fast,
+                 esp_err_to_name(err));
     if (err == ESP_OK) {
+        advertising_fast = fast;
         advertising_start_pending = true;
         ESP_LOGI(GATTS_TABLE_TAG, "Advertising restarted %s", reason);
     } else {
@@ -915,10 +959,43 @@ void handle_led_notify_from_app(uint16_t conn_id, const uint8_t *buffer, size_t 
         pgp_diag_log("LED_UNKNOWN conn=%u len=%u data=%s", conn_id, (unsigned)len, hex);
     }
     ESP_LOGD(GATTS_TABLE_TAG, "LED conn=%u event=%s", conn_id, pgp_led_event_name(event));
-    if (pgp_led_needs_button(event)) {
-        const uint8_t button[2] = {0x03, 0xff};
+    portENTER_CRITICAL(&auto_lock);
+    pgp_auto_client_t *automation = &auto_clients[slot];
+    uint8_t alerts_before = automation->alerts;
+    uint8_t restock_before = automation->restock_remaining;
+    bool press = pgp_auto_on_led(automation, &auto_settings, event);
+    uint8_t alerts_after = automation->alerts;
+    uint8_t restock_after = automation->restock_remaining;
+    portEXIT_CRITICAL(&auto_lock);
+    if (alerts_before != alerts_after || restock_before != restock_after) {
+        pgp_diag_log("AUTO conn=%u event=%s alerts=%u->%u restock=%u->%u", conn_id,
+                     pgp_led_event_name(event), alerts_before, alerts_after,
+                     restock_before, restock_after);
+        if (alerts_before != alerts_after) update_status_led();
+    }
+    if (press) {
+        portENTER_CRITICAL(&auto_lock);
+        uint8_t mode = auto_settings.press_mode;
+        portEXIT_CRITICAL(&auto_lock);
+        uint8_t button[2] = {0x03, 0xff};
+        uint32_t delay_ms = 0;
+        if (mode != PGP_PRESS_INSTANT) {
+            /* Like other open-source catchers: a random delay and hold length
+             * instead of an instant, identical press every time. */
+            pgp_button_random_press(esp_random(), esp_random(), button);
+            delay_ms = mode == PGP_PRESS_NORMAL ? 1000 + esp_random() % 1501 :
+                                                  300 + esp_random() % 501;
+        }
         /* The press only counts while the app still shows this LED pattern. */
-        request_button(slot, button, sizeof(button), pgp_led_press_window_ms(buffer, len));
+        uint32_t window_ms = pgp_led_press_window_ms(buffer, len);
+        if (delay_ms + 500 > window_ms) {
+            delay_ms = window_ms / 2;
+        }
+        request_button(slot, button, sizeof(button), delay_ms, window_ms);
+    } else if (pgp_led_needs_button(event)) {
+        portENTER_CRITICAL(&notification_lock);
+        if (client_counters[slot].generation == client->generation) ++client_counters[slot].skipped;
+        portEXIT_CRITICAL(&notification_lock);
     }
 }
 
@@ -1215,9 +1292,11 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             esp_ble_conn_update_params_t conn_params = {0};
             memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
             /* For the IOS system, please reference the apple official documents about the ble connection parameters restrictions. */
+            /* 30-60 ms (multiples of 15 ms, as iOS requires) leaves room for three
+             * links plus advertising; a press has seconds of slack. */
             conn_params.latency = 0;
-            conn_params.max_int = 0x20;    // max_int = 0x20*1.25ms = 40ms
-            conn_params.min_int = 0x10;    // min_int = 0x10*1.25ms = 20ms
+            conn_params.max_int = 0x30;    // max_int = 0x30*1.25ms = 60ms
+            conn_params.min_int = 0x18;    // min_int = 0x18*1.25ms = 30ms
             conn_params.timeout = 400;    // timeout = 400*10ms = 4000ms
             //start sent the update connection parameters to the peer device.
             esp_ble_gap_update_conn_params(&conn_params);
@@ -1239,6 +1318,12 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             ESP_LOGI(GATTS_TABLE_TAG, "Active clients: %d/%d",
                      active_client_count(), MAX_PGP_CLIENTS);
             update_status_led();
+            if (active_client_count() == 0 && advertising && !advertising_fast &&
+                !advertising_start_pending) {
+                /* Switch back to fast advertising; the stop event restarts it. */
+                esp_err_t stop_err = esp_ble_gap_stop_advertising();
+                pgp_diag_log("ADV_SPEEDUP result=%s", esp_err_to_name(stop_err));
+            }
             /* Disconnect does not stop an already running advertisement. */
             start_advertising_if_available("after disconnect");
             }
@@ -1387,7 +1472,8 @@ static void reset_button_slot(int slot)
 
 /* Button presses bypass the FIFO: one outstanding press per client, merged
  * with duplicates, retried under congestion until its LED pattern ends. */
-static void request_button(int slot, const uint8_t *data, size_t len, uint32_t window_ms)
+static void request_button(int slot, const uint8_t *data, size_t len,
+                           uint32_t delay_ms, uint32_t window_ms)
 {
     notification_client_t target = notification_snapshot(slot);
     if (!target.used || !target.button_enabled || len > sizeof(button_requests[0].data)) {
@@ -1395,10 +1481,12 @@ static void request_button(int slot, const uint8_t *data, size_t len, uint32_t w
                      slot, target.conn_id, target.used, target.button_enabled);
         return;
     }
-    int64_t expires_us = esp_timer_get_time() + (int64_t)window_ms * 1000;
+    int64_t now = esp_timer_get_time();
+    int64_t expires_us = now + (int64_t)window_ms * 1000;
     portENTER_CRITICAL(&notification_lock);
     bool merged = pgp_button_request(&button_requests[slot], target.generation,
-                                     data, (uint8_t)len, expires_us);
+                                     data, (uint8_t)len, now + (int64_t)delay_ms * 1000,
+                                     expires_us);
     client_counters_t *counts = &client_counters[slot];
     if (counts->generation == target.generation) {
         counts->merged += merged ? 1 : 0;
@@ -1417,8 +1505,9 @@ static void rearm_button_after_failure(int slot, uint32_t generation)
     pgp_button_request_t *sent = &button_last_sent[slot];
     if (sent->pending && sent->generation == generation && now < sent->expires_us &&
         !button_requests[slot].pending) {
+        /* The original delay already passed: press again right away. */
         pgp_button_request(&button_requests[slot], generation, sent->data, sent->len,
-                           sent->expires_us);
+                           now, sent->expires_us);
         sent->pending = false;
         if (client_counters[slot].generation == generation) {
             ++client_counters[slot].rearmed;
@@ -1434,7 +1523,7 @@ static void broadcast_button(const uint8_t *data, size_t len)
 {
     for (int i = 0; i < MAX_PGP_CLIENTS; i++) {
         if (notification_snapshot(i).used) {
-            request_button(i, data, len, PGP_LED_PRESS_MIN_MS);
+            request_button(i, data, len, 0, PGP_LED_PRESS_MIN_MS);
         }
     }
 }
@@ -1481,7 +1570,7 @@ static void service_button(int slot, int64_t now)
                      button_attempts[slot]);
         return;
     }
-    if (now < button_retry_at[slot]) {
+    if (now < request.not_before_us || now < button_retry_at[slot]) {
         return;
     }
     esp_err_t err = esp_ble_gatts_send_indicate(current.gatts_if, current.conn_id,
@@ -1596,7 +1685,7 @@ static void notification_task(void *pvParameters)
                 client_counters_t counts = client_counters[slot];
                 portEXIT_CRITICAL(&notification_lock);
                 if (counts.generation != state.generation) continue;
-                pgp_diag_log("TX_HEALTH slot=%d conn=%u gen=%lu cc=%d/%d busy=%d q=%u p=%d sent=%lu req=%lu caught=%lu fled=%lu spun=%lu err=%lu off=%lu unk=%lu miss=%lu dup=%lu rearm=%lu win=%lu",
+                pgp_diag_log("TX_HEALTH slot=%d conn=%u gen=%lu cc=%d/%d busy=%d q=%u p=%d sent=%lu req=%lu caught=%lu fled=%lu spun=%lu err=%lu off=%lu unk=%lu miss=%lu dup=%lu rearm=%lu win=%lu skip=%lu",
                              slot, state.conn_id, (unsigned long)state.generation,
                              state.cert_enabled, state.button_enabled, state.congested,
                              (unsigned)uxQueueMessagesWaiting(notification_queues[slot]), occupied[slot],
@@ -1605,7 +1694,8 @@ static void notification_task(void *pvParameters)
                              (unsigned long)counts.spun, (unsigned long)counts.errors,
                              (unsigned long)counts.off, (unsigned long)counts.unknown,
                              (unsigned long)counts.missed, (unsigned long)counts.merged,
-                             (unsigned long)counts.rearmed, (unsigned long)counts.window_ms);
+                             (unsigned long)counts.rearmed, (unsigned long)counts.window_ms,
+                             (unsigned long)counts.skipped);
             }
             report_at = now + 60000000LL;
         }
@@ -1614,7 +1704,17 @@ static void notification_task(void *pvParameters)
     }
 }
 
-/* Connection-count cycle: N short blue flashes, then one long flash. */
+/* Connection-count cycle: N short blue flashes, then one long flash. While a
+ * phone reports a problem, the end of each 3-s cycle (ticks 18-29) blinks:
+ * box full = fast (100 ms), no balls = medium (200 ms), bag full = slow (300 ms). */
+static bool alert_led_on(uint8_t alerts, unsigned tick)
+{
+    if (tick < 18 || alerts == 0) return false;
+    unsigned period = (alerts & PGP_ALERT_BOX_FULL) ? 2 :
+                      (alerts & PGP_ALERT_NO_BALLS) ? 4 : 6;
+    return (tick - 18) % period < period / 2;
+}
+
 static void status_led_task(void *pvParameters)
 {
     uint8_t connected = 0;
@@ -1628,7 +1728,8 @@ static void status_led_task(void *pvParameters)
         bool on = connected == 0;
         if (connected > 0) {
             on = (tick < 2 * connected && tick % 2 == 0) ||
-                 (tick >= 2 * connected + 2 && tick < 2 * connected + 8);
+                 (tick >= 2 * connected + 2 && tick < 2 * connected + 8) ||
+                 alert_led_on(status_alerts, tick);
         }
         gpio_set_level(STATUS_LED_GPIO, on ? STATUS_LED_ACTIVE_LEVEL :
                       !STATUS_LED_ACTIVE_LEVEL);
@@ -1644,8 +1745,204 @@ static QueueHandle_t uart0_queue;
 static const char *TAG = "uart_events";
 
 
+#define SETTINGS_NAMESPACE "pgp_auto"
+static const char *const press_mode_names[PGP_PRESS_MODE_COUNT] = {
+    "fast(0.3-0.8s)", "normal(1.0-2.5s)", "instant",
+};
+
+static void settings_load(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(SETTINGS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return;   /* Nothing saved yet: keep the defaults. */
+    }
+    uint8_t value;
+    pgp_auto_settings_t loaded = auto_settings;
+    if (nvs_get_u8(handle, "catch", &value) == ESP_OK) loaded.catch_enabled = value != 0;
+    if (nvs_get_u8(handle, "spin", &value) == ESP_OK) loaded.spin_enabled = value != 0;
+    if (nvs_get_u8(handle, "press", &value) == ESP_OK && value < PGP_PRESS_MODE_COUNT) {
+        loaded.press_mode = value;
+    }
+    if (nvs_get_u8(handle, "restock", &value) == ESP_OK && value <= PGP_AUTO_RESTOCK_MAX) {
+        loaded.restock_spins = value;
+    }
+    nvs_close(handle);
+    auto_settings = loaded;
+}
+
+static void settings_save(void)
+{
+    portENTER_CRITICAL(&auto_lock);
+    pgp_auto_settings_t current = auto_settings;
+    portEXIT_CRITICAL(&auto_lock);
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        nvs_set_u8(handle, "catch", current.catch_enabled);
+        nvs_set_u8(handle, "spin", current.spin_enabled);
+        nvs_set_u8(handle, "press", current.press_mode);
+        nvs_set_u8(handle, "restock", current.restock_spins);
+        err = nvs_commit(handle);
+        nvs_close(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Saving settings failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void log_settings(const char *prefix)
+{
+    portENTER_CRITICAL(&auto_lock);
+    pgp_auto_settings_t current = auto_settings;
+    portEXIT_CRITICAL(&auto_lock);
+    ESP_LOGI(TAG, "%s catch=%s spin=%s press=%s restock=%u", prefix,
+             current.catch_enabled ? "on" : "off", current.spin_enabled ? "on" : "off",
+             press_mode_names[current.press_mode], current.restock_spins);
+    pgp_diag_log("SETTINGS catch=%d spin=%d press=%u restock=%u", current.catch_enabled,
+                 current.spin_enabled, current.press_mode, current.restock_spins);
+}
+
+static void print_help(void)
+{
+    ESP_LOGI(TAG, "Commands (type, then Enter). Defaults are saved and survive restarts:");
+    ESP_LOGI(TAG, "  l       list phones: slot, auth, catch/spin, restock, alerts, counts");
+    ESP_LOGI(TAG, "  c / s   toggle catching / Pokestop spinning (default and all phones)");
+    ESP_LOGI(TAG, "  1c 2s   toggle for one phone slot only (until it disconnects)");
+    ESP_LOGI(TAG, "  m       press timing: fast(0.3-0.8s) -> normal(1.0-2.5s) -> instant");
+    ESP_LOGI(TAG, "  n10     out of balls: spin this many stops before catching (0 = off)");
+    ESP_LOGI(TAG, "  1r      slot 1: stop waiting for spins and catch again now");
+    ESP_LOGI(TAG, "  a       clear box/bag/ball alerts on the LED");
+    ESP_LOGI(TAG, "  q / w   press / release the button on all phones (no Enter needed)");
+}
+
+static void list_clients(void)
+{
+    log_settings("Defaults:");
+    for (int slot = 0; slot < MAX_PGP_CLIENTS; ++slot) {
+        notification_client_t state = notification_snapshot(slot);
+        if (!state.used) {
+            ESP_LOGI(TAG, "slot %d: free", slot + 1);
+            continue;
+        }
+        portENTER_CRITICAL(&auto_lock);
+        pgp_auto_client_t automation = auto_clients[slot];
+        portEXIT_CRITICAL(&auto_lock);
+        portENTER_CRITICAL(&notification_lock);
+        client_counters_t counts = client_counters[slot];
+        portEXIT_CRITICAL(&notification_lock);
+        ESP_LOGI(TAG, "slot %d: conn=%u auth=%s catch=%s spin=%s restock_left=%u alerts=%s%s%s",
+                 slot + 1, state.conn_id, state.cert_state == 6 ? "done" : "in_progress",
+                 automation.catch_enabled ? "on" : "off", automation.spin_enabled ? "on" : "off",
+                 automation.restock_remaining,
+                 automation.alerts & PGP_ALERT_BOX_FULL ? "box_full " : "",
+                 automation.alerts & PGP_ALERT_BAG_FULL ? "bag_full " : "",
+                 automation.alerts & PGP_ALERT_NO_BALLS ? "no_balls" : "");
+        ESP_LOGI(TAG, "        pressed=%lu caught=%lu fled=%lu spun=%lu missed=%lu skipped=%lu",
+                 (unsigned long)counts.sent_button, (unsigned long)counts.caught,
+                 (unsigned long)counts.fled, (unsigned long)counts.spun,
+                 (unsigned long)counts.missed, (unsigned long)counts.skipped);
+    }
+}
+
+/* 'c'/'s' toggle a setting for one slot (0-2) or, with slot -1, the saved
+ * default plus every connected phone. */
+static void toggle_setting(int slot, char which)
+{
+    portENTER_CRITICAL(&auto_lock);
+    bool value;
+    if (slot < 0) {
+        bool *setting = which == 'c' ? &auto_settings.catch_enabled : &auto_settings.spin_enabled;
+        *setting = !*setting;
+        value = *setting;
+        for (int i = 0; i < MAX_PGP_CLIENTS; ++i) {
+            if (which == 'c') auto_clients[i].catch_enabled = value;
+            else auto_clients[i].spin_enabled = value;
+        }
+    } else {
+        bool *setting = which == 'c' ? &auto_clients[slot].catch_enabled :
+                                       &auto_clients[slot].spin_enabled;
+        *setting = !*setting;
+        value = *setting;
+    }
+    portEXIT_CRITICAL(&auto_lock);
+    ESP_LOGI(TAG, "%s %s: %s", slot < 0 ? "All phones" : "This slot",
+             which == 'c' ? "catching" : "spinning", value ? "on" : "off");
+    if (slot < 0) {
+        settings_save();
+        log_settings("Saved:");
+    }
+}
+
+static void handle_command(const char *line)
+{
+    size_t length = strlen(line);
+    if (length == 0) {
+        return;
+    }
+    int slot = -1;
+    if (line[0] >= '1' && line[0] <= '0' + MAX_PGP_CLIENTS && length == 2) {
+        slot = line[0] - '1';
+        line++;
+        length = 1;
+    }
+    char command = line[0];
+    if (slot >= 0 && (command == 'c' || command == 's')) {
+        toggle_setting(slot, command);
+    } else if (slot >= 0 && command == 'r') {
+        portENTER_CRITICAL(&auto_lock);
+        auto_clients[slot].restock_remaining = 0;
+        auto_clients[slot].alerts &= ~PGP_ALERT_NO_BALLS;
+        portEXIT_CRITICAL(&auto_lock);
+        update_status_led();
+        ESP_LOGI(TAG, "slot %d: catching resumes now", slot + 1);
+    } else if (slot >= 0) {
+        ESP_LOGW(TAG, "Unknown command; type h for help");
+    } else if (length == 1 && (command == 'c' || command == 's')) {
+        toggle_setting(-1, command);
+    } else if (length == 1 && command == 'm') {
+        portENTER_CRITICAL(&auto_lock);
+        auto_settings.press_mode = (auto_settings.press_mode + 1) % PGP_PRESS_MODE_COUNT;
+        portEXIT_CRITICAL(&auto_lock);
+        settings_save();
+        log_settings("Saved:");
+    } else if (command == 'n' && length >= 2 && length <= 3) {
+        char *end = NULL;
+        long spins = strtol(line + 1, &end, 10);
+        if (end && *end == 0 && spins >= 0 && spins <= PGP_AUTO_RESTOCK_MAX) {
+            portENTER_CRITICAL(&auto_lock);
+            auto_settings.restock_spins = (uint8_t)spins;
+            portEXIT_CRITICAL(&auto_lock);
+            settings_save();
+            log_settings("Saved:");
+        } else {
+            ESP_LOGW(TAG, "Use n0 to n%d", PGP_AUTO_RESTOCK_MAX);
+        }
+    } else if (length == 1 && command == 'a') {
+        portENTER_CRITICAL(&auto_lock);
+        for (int i = 0; i < MAX_PGP_CLIENTS; ++i) auto_clients[i].alerts = 0;
+        portEXIT_CRITICAL(&auto_lock);
+        update_status_led();
+        ESP_LOGI(TAG, "Alerts cleared");
+    } else if (length == 1 && command == 'l') {
+        list_clients();
+    } else if (length == 1 && (command == 'h' || command == '?')) {
+        print_help();
+    } else {
+        ESP_LOGW(TAG, "Unknown command; type h for help");
+    }
+}
+
+static void manual_button(bool pressed)
+{
+    ESP_LOGI(TAG, "%s", pressed ? "[push button]" : "[unpush button]");
+    const uint8_t notify_data[2] = {pressed ? 0x03 : 0x00, pressed ? 0xff : 0x00};
+    broadcast_button(notify_data, sizeof(notify_data));
+}
+
 static void uart_event_task(void *pvParameters)
 {
+    char line[16];
+    size_t line_length = 0;
     uart_event_t event;
 
     uint8_t* dtmp = (uint8_t*) malloc(RD_BUF_SIZE);
@@ -1664,23 +1961,18 @@ static void uart_event_task(void *pvParameters)
                     uart_read_bytes(EX_UART_NUM, dtmp, event.size, portMAX_DELAY);
                     ESP_LOGI(TAG, "[DATA EVT]:");
                     uart_write_bytes(EX_UART_NUM, (const char*) dtmp, event.size);
-		    if (dtmp[0]=='q') {
-			    ESP_LOGI(TAG, "[push button]");
-			    uint8_t notify_data[2];
-                            notify_data[0] = 0x03;
-                            notify_data[1] = 0xff;
-
-			    broadcast_button(notify_data, sizeof(notify_data));
-		    }
-
-		    if (dtmp[0]=='w') {
-			    ESP_LOGI(TAG, "[unpush button]");
-			    uint8_t notify_data[2];
-                            notify_data[0] = 0x00;
-                            notify_data[1] = 0x00;
-
-			    broadcast_button(notify_data, sizeof(notify_data));
-		    }
+                    for (size_t i = 0; i < event.size && i < RD_BUF_SIZE; ++i) {
+                        char ch = (char)dtmp[i];
+                        if (line_length == 0 && (ch == 'q' || ch == 'w')) {
+                            manual_button(ch == 'q');   /* legacy one-key commands */
+                        } else if (ch == '\r' || ch == '\n') {
+                            line[line_length] = 0;
+                            handle_command(line);
+                            line_length = 0;
+                        } else if (line_length + 1 < sizeof(line)) {
+                            line[line_length++] = ch;
+                        }
+                    }
 
                     break;
                 //Event of HW FIFO overflow detected
@@ -1736,6 +2028,7 @@ void app_main()
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK( ret );
+    settings_load();
 
 
     /* Configure parameters of an UART driver,
@@ -1762,7 +2055,9 @@ void app_main()
         configASSERT(notification_queues[i] != NULL);
     }
     pgp_diag_init();
-    pgp_guard_init(&adv_params);
+    pgp_guard_init(&adv_params, &adv_params_connected);
+    log_settings("Settings:");
+    ESP_LOGI(TAG, "Type h and Enter on this serial port for commands");
     status_led_queue = xQueueCreate(1, sizeof(uint8_t));
     configASSERT(status_led_queue != NULL);
     gpio_config_t status_led_config = {
