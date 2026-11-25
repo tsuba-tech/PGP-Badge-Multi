@@ -50,10 +50,10 @@ Automatic button responses to LED commands target only their originating client.
 
 | 設定 / Setting | 現行値 / Current value |
 | --- | --- |
-| 通知キュー / Notification queue | 各スロット16件、証明書とボタンを同じFIFOで管理 / 16 entries per slot, shared FIFO for certificate and button |
+| 通知キュー / Notification queue | 各スロット16件の証明書FIFO。ボタンは端末ごとに1件の押下要求（重複は統合） / 16-entry certificate FIFO per slot; buttons use one merged press request per client |
 | ワーカー / Worker | 優先度8、20ms周期、各スロットを順に処理 / Priority 8, 20-ms loop, each slot gets a turn |
 | API失敗後 / After immediate API failure | 通常100ms、混雑時200ms後に再試行 / Retry after 100 ms, or 200 ms with congestion hint |
-| 有効期限 / Lifetime from enqueue | 証明書8秒、ボタン2秒 / Certificate 8 s, button 2 s |
+| 有効期限 / Lifetime from enqueue | 証明書8秒、ボタンはLEDパターン長（2〜10秒） / Certificate 8 s, button = LED pattern length (2–10 s) |
 
 BLEコールバックはキュー満杯時に待たず、破棄を記録する。ワーカーはスロットごとに1件を保留し、他端末の処理を続行する。接続と認証開始に世代番号を付け、切断・再接続・認証再開始後の古い世代の通知を破棄する。送信直前に購読と期限も再確認する。共有する送信メタデータだけを短いクリティカルセクションでコピーし、BLE送信APIはその外で呼ぶ。
 
@@ -130,9 +130,9 @@ Added on 2026-10-11, `main/pgp-guard.c` owns supervision-only copies protected b
 
 Notification and supervisor tasks subscribe individually to the task watchdog and feed it only after a completed pass. Runtime configuration sets a 10-s timeout and enables panic unless reset-loop protection is active; existing CPU idle subscriptions remain. Callback entry/exit tracking detects a callback executing for 10 s, not absence of incoming events.
 
-接続または認証再開始から120秒で認証未完了、認証購読中に状態が45秒進まない、認証通知が1件失敗、ボタン通知が30秒の窓内で3件失敗、のいずれかで端末別復旧へ進む。失敗はキュー満杯、送信期限切れ、非同期エラーが対象。即時APIエラーは通知タスクが有効期限まで再試行する。購読OFF・古い世代の通知破棄は異常に数えない。認証済み端末の無通信時間は制限しない。
+接続または認証再開始から120秒で認証未完了、認証購読中に状態が45秒進まない、認証通知が失敗（非同期エラーは3回まで再送後、キュー満杯・期限切れは即時）、のいずれかで端末別復旧へ進む。ボタン通知の失敗は復旧条件にしない（2026-11-25変更。切断するとスマホ側の再接続操作が必要になり、自動操作が止まるため）。即時APIエラーは通知タスクが有効期限まで再試行する。購読OFF・古い世代の通知破棄は異常に数えない。認証済み端末の無通信時間は制限しない。
 
-Peer recovery triggers on incomplete setup after 120 s, stalled subscribed authentication after 45 s, one failed certificate notification, or three failed button notifications within a 30-s counting window. Overflow, expiry and asynchronous errors count; immediate API errors retain bounded sender retries. Disabled subscriptions and stale generations do not count as faults. Authenticated inactivity has no timeout.
+Peer recovery triggers on incomplete setup after 120 s, stalled subscribed authentication after 45 s, or a failed certificate notification (asynchronous errors after three resends; overflow and expiry immediately). Button failures never trigger recovery since 2026-11-25: a disconnect needs the user to reconnect in the app and stops automation. Immediate API errors retain bounded sender retries. Disabled subscriptions and stale generations do not count as faults. Authenticated inactivity has no timeout.
 
 監視スロットの世代を再確認した上で、相手アドレス指定の`esp_ble_gap_disconnect`を呼ぶ。接続番号の再利用によって別端末を切断しないためである。同じ端末が検証直後に再接続する競合はなおあり得る。切断要求は15秒間隔で最大3回。全ての残存接続で最初の切断要求から120秒経っても切断が完了しない場合に限り、この経路で本体を再起動する。正常な別接続がある場合は本体を再起動しない。
 

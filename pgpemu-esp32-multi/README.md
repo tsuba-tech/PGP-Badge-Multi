@@ -164,7 +164,7 @@ python .\tools\download-diagnostics.py --port COM3
 | 通知タスク・監視タスクが10秒間進まない | タスクwatchdogで本体再起動。両CPUのidle監視も継続 |
 | 実行中のBLEコールバックが10秒戻らない | 本体再起動。BLEイベントが来ないだけでは発動しない |
 | 接続・認証開始から120秒で認証未完了、または認証購読中に状態が45秒進まない | 該当端末だけ切断して再接続待ち |
-| 認証通知1件の送信失敗が確定、または30秒の集計窓内でボタン通知3件が失敗 | 該当端末だけ切断。即時API失敗は従来どおり期限まで再試行し、期限切れ・満杯・非同期失敗を監視へ報告 |
+| 認証通知が3回の再送後も失敗、またはキュー満杯・8秒の期限切れ | 該当端末だけ切断。ボタン通知の失敗では切断しません（第9節） |
 | 空きスロットがあるのにAdvertisingが開始できない | 停止確認後5秒、開始待ちなら20秒で再試行対象。監視側の再試行間隔は20秒以上 |
 | 全接続で切断要求が120秒完了しない | 本体再起動。他に正常な接続があれば本体を再起動しない |
 | BLE初期設定が120秒終わらない、または接続0台でAdvertising復旧が120秒以上進まない | 本体再起動 |
@@ -188,6 +188,16 @@ ESP32はAdvertisingを再開できますが、**スマホへ再接続を強制�
 保存時は書き込み後に読み戻して照合します。取得ツールの`non_record`は診断レコードの識別子がない領域、`crc_bad`は識別子があるのにCRCが合わないレコードです。両者を保存破損として一括扱いしません。実機ログを再調査した結果、以前の「CRC不一致736件」は識別子のない736領域で、CRC不一致は0件でした。旧データ等が残っている可能性があるため、診断領域の生バイナリも公開しないでください。
 
 CコードのLED分類・認証遷移と診断デコーダーをホスト上でテストしています。変更後の捕獲・2〜3台運用・自動復旧は実機での確認が必要です。まず2台で試し、問題の時刻と診断ログを残してください。スマホの再接続はPokémon GO側の操作が必要な場合があります。
+
+### 9. 押し損ね対策と輻輳時の動作（2026-11-25）
+
+- **切断を最後の手段にしました。** スマホは自動で再接続しないことが多く、切断するとキャッチが止まるためです。ボタン通知の失敗・期限切れでは切断せず、`miss`として数えるだけにしました。認証通知は送信失敗が報告されたら同じ通知を最大3回送り直し、それでも失敗したときだけ切断します（`CERT_RESEND`）。
+- **ボタンの押下期限をLED表示の長さに合わせました。** 各パターン先頭の持続時間（50ms単位、spezifisch/pgpemuと同じ解釈）を合計し、2〜10秒に収めます。輻輳中もこの期限まで再試行します。
+- **二重押しを防ぎました。** 未送信の押下がある間に同じ要求が来ても押下は1回にまとめ、期限だけ延ばします（`dup`）。
+- **送れたはずの押下が失敗と報告されたら押し直します。** LED表示がまだ続いている間だけです（`rearm`）。
+- 認証通知はボタンより優先して送ります。
+
+`TX_HEALTH`と`CLIENT_SUMMARY`に`miss`（期限内に送れなかった押下）、`dup`（まとめた重複要求）、`rearm`（押し直し）、`win`（直近の押下期限ms）を追加しました。`miss`が増える場合は混雑か電波状態を疑ってください。再接続用の認証（state 4）は36バイト未満の入力を受け付けないようにしました。
 
 ### 謝辞・ライセンス
 
@@ -332,7 +342,7 @@ Software supervision was added on 2026-10-11. Build checks do not establish hard
 | Notification/supervisor task fails to complete a pass for 10 s | Task watchdog restarts the ESP32; both CPU idle tasks remain monitored |
 | An executing BLE callback does not return for 10 s | Restart; absence of BLE events alone does not trigger recovery |
 | Authentication incomplete 120 s after connection/authentication restart, or no state progress for 45 s while certificate notifications are enabled | Disconnect only the affected peer |
-| One failed certificate notification, or three failed button notifications within a 30-s counting window | Disconnect that peer; immediate API failures retain existing bounded retries, with expiry, overflow and asynchronous failures reported to supervision |
+| A certificate notification still failing after three resends, or overflowing / expiring after 8 s | Disconnect that peer. Button notification failures never disconnect (section 9) |
 | Advertising missing with spare capacity | Eligible after 5 s inactive or 20 s pending; supervisor retries are at least 20 s apart |
 | Every remaining client's close request remains incomplete for 120 s | Restart; one unhealthy peer does not trigger this restart while another link remains healthy |
 | BLE setup incomplete for 120 s, or advertising recovery stuck for 120 s with zero clients | Restart |
@@ -356,6 +366,16 @@ In `TX_HEALTH`, `cc` is certificate/button subscription status, `busy` congestio
 Each flash record is read back and compared after writing. Export reports distinguish `non_record` (missing diagnostic magic) from `crc_bad` (recognized record with a CRC mismatch). Rechecking the field dump found 736 non-record slots and zero CRC failures, not 736 damaged records. Old data may remain in unused sectors: do not publish raw diagnostic binaries either.
 
 Host tests exercise the production LED classifier, authentication transition control flow and decoder. Capture behavior, two/three-phone operation and recovery after this change still need hardware verification. Start with two phones and retain diagnostics with approximate fault times. Phone reconnection may require a Pokémon GO action.
+
+### 9. Missed-press prevention and congestion behavior (2026-11-25)
+
+- **Disconnecting is now a last resort**, because phones often do not reconnect by themselves. Button failures and expiries are counted as `miss` and never disconnect. A certificate notification reported as failed is resent up to three times (`CERT_RESEND`) before the peer is recovered.
+- **Press deadline follows the LED pattern length**: the sum of each pattern's duration byte (50-ms units, as in spezifisch/pgpemu), clamped to 2–10 s. Presses keep retrying under congestion until then.
+- **No double presses**: a duplicate request while a press is still pending merges into it and only extends its deadline (`dup`).
+- **A press the stack later reports as unsent is pressed again** while its LED pattern is still showing (`rearm`).
+- Authentication notifications are sent before button presses.
+
+`TX_HEALTH` and `CLIENT_SUMMARY` gain `miss`, `dup`, `rearm` and `win` (latest press window in ms). A rising `miss` points to congestion or poor radio conditions. Reconnect authentication (state 4) now rejects inputs shorter than 36 bytes.
 
 ### Credits and license
 

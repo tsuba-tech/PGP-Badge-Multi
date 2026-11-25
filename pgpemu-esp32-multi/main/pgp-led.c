@@ -61,3 +61,19 @@ const char *pgp_led_event_name(pgp_led_event_t event)
         "pokestop", "caught", "fled", "spun", "bag_full", "box_full", "balls_or_range"};
     return (unsigned)event < sizeof(names) / sizeof(names[0]) ? names[event] : "invalid";
 }
+
+uint32_t pgp_led_press_window_ms(const uint8_t *data, size_t length)
+{
+    if (pgp_led_classify(data, length) == PGP_LED_INVALID) {
+        return PGP_LED_PRESS_MIN_MS;
+    }
+    uint32_t total = 0;
+    unsigned patterns = data[3] & 31;
+    for (unsigned i = 0; i < patterns; ++i) {
+        total += data[4 + 3 * i];
+    }
+    total *= PGP_LED_DURATION_UNIT_MS;
+    if (total < PGP_LED_PRESS_MIN_MS) return PGP_LED_PRESS_MIN_MS;
+    if (total > PGP_LED_PRESS_MAX_MS) return PGP_LED_PRESS_MAX_MS;
+    return total;
+}

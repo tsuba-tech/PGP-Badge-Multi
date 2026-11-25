@@ -18,7 +18,6 @@
 #define CLOSE_STUCK_US (120 * SECOND)
 #define ADV_RETRY_US (5 * SECOND)
 #define ADV_PENDING_US (20 * SECOND)
-#define FAILURE_WINDOW_US (30 * SECOND)
 #define STABLE_BOOT_US (600 * SECOND)
 #define RTC_MAGIC 0x50475057U
 
@@ -31,8 +30,6 @@ typedef struct {
     bool cert_enabled;
     int64_t connected_at;
     int64_t auth_progress_at;
-    int64_t failure_window_at;
-    unsigned failures;
     bool fault;
     int64_t close_started_at;
     int64_t close_retry_at;
@@ -142,22 +139,17 @@ void pgp_guard_advertising(bool ready, bool active, bool pending, int clients)
 
 void pgp_guard_tx_failure(int slot, uint32_t generation, bool certificate)
 {
-    if (!initialized || slot < 0 || slot >= PGP_GUARD_CLIENTS) {
+    /* Button losses never disconnect: the phone usually does not reconnect by
+     * itself, so a disconnect stops catching until the user notices. A dead
+     * link is dropped by the BLE supervision timeout anyway. Callers report a
+     * certificate failure only after its resend budget is exhausted. */
+    if (!initialized || !certificate || slot < 0 || slot >= PGP_GUARD_CLIENTS) {
         return;
     }
-    int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&lock);
     guarded_client_t *client = &links[slot];
     if (client->used && client->generation == generation) {
-        if (!client->failures || now - client->failure_window_at > FAILURE_WINDOW_US) {
-            client->failure_window_at = now;
-            client->failures = 0;
-        }
-        ++client->failures;
-        /* One lost authentication message, or repeated failed button messages. */
-        if (certificate || client->failures >= 3) {
-            client->fault = true;
-        }
+        client->fault = true;
     }
     portEXIT_CRITICAL(&lock);
 }

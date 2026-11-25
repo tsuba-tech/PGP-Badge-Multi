@@ -97,21 +97,22 @@ class AuthenticationQueueTests(unittest.TestCase):
 
     def test_accepted_queue_advances_only_originating_client(self):
         for state, next_state, length in [(0, 1, 20), (1, 2, 52), (2, 6, 52),
-                                          (3, 4, 20), (4, 5, 20), (5, 6, 5)]:
+                                          (3, 4, 20), (4, 5, 36), (5, 6, 5)]:
             for conn in (0, 1):
                 with self.subTest(state=state, conn=conn):
                     self.assertEqual(self.native.test_protocol(state, 1, conn, length), next_state)
                     self.assertEqual(self.native.test_queue_calls(), 1)
 
     def test_rejected_queue_never_advances_state(self):
-        for state, length in [(0, 20), (1, 52), (2, 52), (3, 20), (4, 20), (5, 5)]:
+        for state, length in [(0, 20), (1, 52), (2, 52), (3, 20), (4, 36), (5, 5)]:
             for conn in (0, 1):
                 with self.subTest(state=state, conn=conn):
                     self.assertEqual(self.native.test_protocol(state, 0, conn, length), state)
                     self.assertEqual(self.native.test_queue_calls(), 1)
 
     def test_short_authentication_input_does_not_advance(self):
-        for state, length in [(0, 19), (1, 51), (2, 51), (3, 19), (4, 19), (5, 4)]:
+        # State 4 reads a 32-byte reconnect challenge after the 4-byte header.
+        for state, length in [(0, 19), (1, 51), (2, 51), (3, 19), (4, 35), (4, 20), (5, 4)]:
             self.assertEqual(self.native.test_protocol(state, 1, 0, length), state)
             self.assertEqual(self.native.test_queue_calls(), 0)
 

@@ -43,6 +43,8 @@ class LedClassifierTests(unittest.TestCase):
         cls.native.pgp_led_needs_button.restype = ctypes.c_bool
         cls.native.pgp_led_event_name.argtypes = [ctypes.c_int]
         cls.native.pgp_led_event_name.restype = ctypes.c_char_p
+        cls.native.pgp_led_press_window_ms.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        cls.native.pgp_led_press_window_ms.restype = ctypes.c_uint32
 
     def classify(self, data):
         buffer = ctypes.create_string_buffer(data)
@@ -97,6 +99,28 @@ class LedClassifierTests(unittest.TestCase):
             name, press = self.classify(data)
             if len(data) < 4 or (data[3] & 31) > (len(data) - 4) // 3:
                 self.assertEqual((name, press), ("invalid", False))
+
+    def window(self, data):
+        buffer = ctypes.create_string_buffer(data)
+        return self.native.pgp_led_press_window_ms(buffer, len(data))
+
+    def test_press_window_follows_pattern_duration(self):
+        # Duration bytes are 50 ms units; packet() uses 10 (500 ms) per pattern.
+        self.assertEqual(self.window(packet(*([GREEN, OFF] * 4))), 4000)
+        data = bytearray(packet(GREEN, OFF))
+        data[4] = 60
+        data[7] = 40
+        self.assertEqual(self.window(bytes(data)), 5000)
+
+    def test_press_window_is_clamped(self):
+        self.assertEqual(self.window(packet(GREEN)), 2000)
+        long_pattern = bytearray(packet(*([GREEN] * 31)))
+        for i in range(31):
+            long_pattern[4 + 3 * i] = 255
+        self.assertEqual(self.window(bytes(long_pattern)), 10000)
+        for data in [b"", b"\0\0\0\x1f", packet(GREEN)[:-1]]:
+            self.assertEqual(self.window(data), 2000)
+        self.assertEqual(self.native.pgp_led_press_window_ms(None, 10), 2000)
 
     @unittest.skipUnless(os.environ.get("PGP_LED_REPLAY"), "Optional private diagnostic replay")
     def test_private_field_log_replay(self):
